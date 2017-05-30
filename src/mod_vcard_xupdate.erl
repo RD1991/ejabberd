@@ -3,24 +3,6 @@
 %%% Author  : Igor Goryachev <igor@goryachev.org>
 %%% Purpose : Add avatar hash in presence on behalf of client (XEP-0153)
 %%% Created : 9 Mar 2007 by Igor Goryachev <igor@goryachev.org>
-%%%
-%%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
-%%%
-%%% This program is free software; you can redistribute it and/or
-%%% modify it under the terms of the GNU General Public License as
-%%% published by the Free Software Foundation; either version 2 of the
-%%% License, or (at your option) any later version.
-%%%
-%%% This program is distributed in the hope that it will be useful,
-%%% but WITHOUT ANY WARRANTY; without even the implied warranty of
-%%% MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-%%% General Public License for more details.
-%%%
-%%% You should have received a copy of the GNU General Public License along
-%%% with this program; if not, write to the Free Software Foundation, Inc.,
-%%% 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
-%%%
 %%%----------------------------------------------------------------------
 
 -module(mod_vcard_xupdate).
@@ -28,147 +10,227 @@
 -behaviour(gen_mod).
 
 %% gen_mod callbacks
--export([start/2, stop/1, reload/3]).
+-export([start/2, stop/1]).
 
--export([update_presence/1, vcard_set/3, remove_user/2,
-	 mod_opt_type/1, depends/2]).
+-export([update_presence/3, vcard_set/3, export/1,
+	 import/1, import/3, mod_opt_type/1]).
 
 -include("ejabberd.hrl").
 -include("logger.hrl").
--include("xmpp.hrl").
 
--define(VCARD_XUPDATE_CACHE, vcard_xupdate_cache).
+-include("jlib.hrl").
+
+-record(vcard_xupdate, {us = {<<>>, <<>>} :: {binary(), binary()},
+                        hash = <<>>       :: binary()}).
 
 %%====================================================================
 %% gen_mod callbacks
 %%====================================================================
 
 start(Host, Opts) ->
-    init_cache(Host, Opts),
-    ejabberd_hooks:add(c2s_self_presence, Host, ?MODULE,
+    case gen_mod:db_type(Host, Opts) of
+      mnesia ->
+	  mnesia:create_table(vcard_xupdate,
+			      [{disc_copies, [node()]},
+			       {attributes,
+				record_info(fields, vcard_xupdate)}]),
+          update_table();
+      _ -> ok
+    end,
+    ejabberd_hooks:add(c2s_update_presence, Host, ?MODULE,
 		       update_presence, 100),
     ejabberd_hooks:add(vcard_set, Host, ?MODULE, vcard_set,
 		       100),
-    ejabberd_hooks:add(remove_user, Host, ?MODULE, remove_user, 50).
+    ok.
 
 stop(Host) ->
-    ejabberd_hooks:delete(c2s_self_presence, Host,
+    ejabberd_hooks:delete(c2s_update_presence, Host,
 			  ?MODULE, update_presence, 100),
     ejabberd_hooks:delete(vcard_set, Host, ?MODULE,
 			  vcard_set, 100),
-    ejabberd_hooks:delete(remove_user, Host, ?MODULE, remove_user, 50).
-
-reload(Host, NewOpts, _OldOpts) ->
-    init_cache(Host, NewOpts).
-
-depends(_Host, _Opts) ->
-    [{mod_vcard, hard}].
+    ok.
 
 %%====================================================================
 %% Hooks
 %%====================================================================
--spec update_presence({presence(), ejabberd_c2s:state()})
-      -> {presence(), ejabberd_c2s:state()}.
-update_presence({#presence{type = available} = Pres,
-		 #{jid := #jid{luser = LUser, lserver = LServer}} = State}) ->
-    Hash = get_xupdate(LUser, LServer),
-    Pres1 = xmpp:set_subtag(Pres, #vcard_xupdate{hash = Hash}),
-    {Pres1, State};
-update_presence(Acc) ->
-    Acc.
 
--spec vcard_set(binary(), binary(), xmlel()) -> ok.
-vcard_set(LUser, LServer, _VCARD) ->
-    ets_cache:delete(?VCARD_XUPDATE_CACHE, {LUser, LServer}),
-    ejabberd_sm:force_update_presence({LUser, LServer}).
+update_presence(#xmlel{name = <<"presence">>, attrs = Attrs} = Packet,
+  User, Host) ->
+    case fxml:get_attr_s(<<"type">>, Attrs) of
+      <<>> -> presence_with_xupdate(Packet, User, Host);
+      _ -> Packet
+    end;
+update_presence(Packet, _User, _Host) -> Packet.
 
--spec remove_user(binary(), binary()) -> ok.
-remove_user(User, Server) ->
-    LUser = jid:nodeprep(User),
-    LServer = jid:nameprep(Server),
-    ets_cache:delete(?VCARD_XUPDATE_CACHE, {LUser, LServer}).
+vcard_set(LUser, LServer, VCARD) ->
+    US = {LUser, LServer},
+    case fxml:get_path_s(VCARD,
+			[{elem, <<"PHOTO">>}, {elem, <<"BINVAL">>}, cdata])
+	of
+      <<>> -> remove_xupdate(LUser, LServer);
+      BinVal ->
+	  add_xupdate(LUser, LServer,
+		      p1_sha:sha(jlib:decode_base64(BinVal)))
+    end,
+    ejabberd_sm:force_update_presence(US).
 
 %%====================================================================
 %% Storage
 %%====================================================================
--spec get_xupdate(binary(), binary()) -> binary() | undefined.
+
+add_xupdate(LUser, LServer, Hash) ->
+    add_xupdate(LUser, LServer, Hash,
+		gen_mod:db_type(LServer, ?MODULE)).
+
+add_xupdate(LUser, LServer, Hash, mnesia) ->
+    F = fun () ->
+		mnesia:write(#vcard_xupdate{us = {LUser, LServer},
+					    hash = Hash})
+	end,
+    mnesia:transaction(F);
+add_xupdate(LUser, LServer, Hash, riak) ->
+    {atomic, ejabberd_riak:put(#vcard_xupdate{us = {LUser, LServer},
+                                              hash = Hash},
+			       vcard_xupdate_schema())};
+add_xupdate(LUser, LServer, Hash, odbc) ->
+    Username = ejabberd_odbc:escape(LUser),
+    SHash = ejabberd_odbc:escape(Hash),
+    F = fun () ->
+		odbc_queries:update_t(<<"vcard_xupdate">>,
+				      [<<"username">>, <<"hash">>],
+				      [Username, SHash],
+				      [<<"username='">>, Username, <<"'">>])
+	end,
+    ejabberd_odbc:sql_transaction(LServer, F).
+
 get_xupdate(LUser, LServer) ->
-    Result = case use_cache(LServer) of
-		 true ->
-		     ets_cache:lookup(
-		       ?VCARD_XUPDATE_CACHE, {LUser, LServer},
-		       fun() -> db_get_xupdate(LUser, LServer) end);
-		 false ->
-		     db_get_xupdate(LUser, LServer)
-	     end,
-    case Result of
-	{ok, Hash} -> Hash;
-	error -> undefined
-    end.
+    get_xupdate(LUser, LServer,
+		gen_mod:db_type(LServer, ?MODULE)).
 
--spec db_get_xupdate(binary(), binary()) -> {ok, binary()} | error.
-db_get_xupdate(LUser, LServer) ->
-    case mod_vcard:get_vcard(LUser, LServer) of
-	[VCard] ->
-	    {ok, compute_hash(VCard)};
-	_ ->
-	    error
-    end.
-
--spec init_cache(binary(), gen_mod:opts()) -> ok.
-init_cache(Host, Opts) ->
-    case use_cache(Host) of
-	true ->
-	    CacheOpts = cache_opts(Host, Opts),
-	    ets_cache:new(?VCARD_XUPDATE_CACHE, CacheOpts);
-	false ->
-	    ets_cache:delete(?VCARD_XUPDATE_CACHE)
-    end.
-
--spec cache_opts(binary(), gen_mod:opts()) -> [proplists:property()].
-cache_opts(Host, Opts) ->
-    MaxSize = gen_mod:get_opt(
-		cache_size, Opts,
-		ejabberd_config:cache_size(Host)),
-    CacheMissed = gen_mod:get_opt(
-		    cache_missed, Opts,
-		    ejabberd_config:cache_missed(Host)),
-    LifeTime = case gen_mod:get_opt(
-		      cache_life_time, Opts,
-		      ejabberd_config:cache_life_time(Host)) of
-		   infinity -> infinity;
-		   I -> timer:seconds(I)
-	       end,
-    [{max_size, MaxSize}, {cache_missed, CacheMissed}, {life_time, LifeTime}].
-
--spec use_cache(binary()) -> boolean().
-use_cache(Host) ->
-    gen_mod:get_module_opt(
-      Host, ?MODULE, use_cache,
-      ejabberd_config:use_cache(Host)).
-
--spec compute_hash(xmlel()) -> binary().
-compute_hash(VCard) ->
-    case fxml:get_path_s(VCard,
-			 [{elem, <<"PHOTO">>},
-			  {elem, <<"BINVAL">>},
-			  cdata]) of
-	<<>> ->
-	    <<>>;
-	BinVal ->
-	    try str:sha(base64:decode(BinVal))
-	    catch _:badarg -> <<>>
-	    end
-    end.
-
-%%====================================================================
-%% Options
-%%====================================================================
-mod_opt_type(O) when O == cache_life_time; O == cache_size ->
-    fun (I) when is_integer(I), I > 0 -> I;
-        (infinity) -> infinity
+get_xupdate(LUser, LServer, mnesia) ->
+    case mnesia:dirty_read(vcard_xupdate, {LUser, LServer})
+	of
+      [#vcard_xupdate{hash = Hash}] -> Hash;
+      _ -> undefined
     end;
-mod_opt_type(O) when O == use_cache; O == cache_missed ->
-    fun (B) when is_boolean(B) -> B end;
-mod_opt_type(_) ->
-    [cache_life_time, cache_size, use_cache, cache_missed].
+get_xupdate(LUser, LServer, riak) ->
+    case ejabberd_riak:get(vcard_xupdate, vcard_xupdate_schema(),
+			   {LUser, LServer}) of
+        {ok, #vcard_xupdate{hash = Hash}} -> Hash;
+        _ -> undefined
+    end;
+get_xupdate(LUser, LServer, odbc) ->
+    Username = ejabberd_odbc:escape(LUser),
+    case ejabberd_odbc:sql_query(LServer,
+				 [<<"select hash from vcard_xupdate where "
+				    "username='">>,
+				  Username, <<"';">>])
+	of
+      {selected, [<<"hash">>], [[Hash]]} -> Hash;
+      _ -> undefined
+    end.
+
+remove_xupdate(LUser, LServer) ->
+    remove_xupdate(LUser, LServer,
+		   gen_mod:db_type(LServer, ?MODULE)).
+
+remove_xupdate(LUser, LServer, mnesia) ->
+    F = fun () ->
+		mnesia:delete({vcard_xupdate, {LUser, LServer}})
+	end,
+    mnesia:transaction(F);
+remove_xupdate(LUser, LServer, riak) ->
+    {atomic, ejabberd_riak:delete(vcard_xupdate, {LUser, LServer})};
+remove_xupdate(LUser, LServer, odbc) ->
+    Username = ejabberd_odbc:escape(LUser),
+    F = fun () ->
+		ejabberd_odbc:sql_query_t([<<"delete from vcard_xupdate where username='">>,
+					   Username, <<"';">>])
+	end,
+    ejabberd_odbc:sql_transaction(LServer, F).
+
+%%%----------------------------------------------------------------------
+%%% Presence stanza rebuilding
+%%%----------------------------------------------------------------------
+
+presence_with_xupdate(#xmlel{name = <<"presence">>,
+			     attrs = Attrs, children = Els},
+		      User, Host) ->
+    XPhotoEl = build_xphotoel(User, Host),
+    Els2 = presence_with_xupdate2(Els, [], XPhotoEl),
+    #xmlel{name = <<"presence">>, attrs = Attrs,
+	   children = Els2}.
+
+presence_with_xupdate2([], Els2, XPhotoEl) ->
+    lists:reverse([XPhotoEl | Els2]);
+%% This clause assumes that the x element contains only the XMLNS attribute:
+presence_with_xupdate2([#xmlel{name = <<"x">>,
+			       attrs = [{<<"xmlns">>, ?NS_VCARD_UPDATE}]}
+			| Els],
+		       Els2, XPhotoEl) ->
+    presence_with_xupdate2(Els, Els2, XPhotoEl);
+presence_with_xupdate2([El | Els], Els2, XPhotoEl) ->
+    presence_with_xupdate2(Els, [El | Els2], XPhotoEl).
+
+build_xphotoel(User, Host) ->
+    Hash = get_xupdate(User, Host),
+    PhotoSubEls = case Hash of
+		    Hash when is_binary(Hash) -> [{xmlcdata, Hash}];
+		    _ -> []
+		  end,
+    PhotoEl = [#xmlel{name = <<"photo">>, attrs = [],
+		      children = PhotoSubEls}],
+    #xmlel{name = <<"x">>,
+	   attrs = [{<<"xmlns">>, ?NS_VCARD_UPDATE}],
+	   children = PhotoEl}.
+
+vcard_xupdate_schema() ->
+    {record_info(fields, vcard_xupdate), #vcard_xupdate{}}.
+
+update_table() ->
+    Fields = record_info(fields, vcard_xupdate),
+    case mnesia:table_info(vcard_xupdate, attributes) of
+      Fields ->
+            ejabberd_config:convert_table_to_binary(
+              vcard_xupdate, Fields, set,
+              fun(#vcard_xupdate{us = {U, _}}) -> U end,
+              fun(#vcard_xupdate{us = {U, S}, hash = Hash} = R) ->
+                      R#vcard_xupdate{us = {iolist_to_binary(U),
+                                            iolist_to_binary(S)},
+                                      hash = iolist_to_binary(Hash)}
+              end);
+        _ ->            
+            ?INFO_MSG("Recreating vcard_xupdate table", []),
+            mnesia:transform_table(vcard_xupdate, ignore, Fields)
+    end.
+
+export(_Server) ->
+    [{vcard_xupdate,
+      fun(Host, #vcard_xupdate{us = {LUser, LServer}, hash = Hash})
+            when LServer == Host ->
+              Username = ejabberd_odbc:escape(LUser),
+              SHash = ejabberd_odbc:escape(Hash),
+              [[<<"delete from vcard_xupdate where username='">>,
+                Username, <<"';">>],
+               [<<"insert into vcard_xupdate(username, "
+                  "hash) values ('">>,
+                Username, <<"', '">>, SHash, <<"');">>]];
+         (_Host, _R) ->
+              []
+      end}].
+
+import(LServer) ->
+    [{<<"select username, hash from vcard_xupdate;">>,
+      fun([LUser, Hash]) ->
+              #vcard_xupdate{us = {LUser, LServer}, hash = Hash}
+      end}].
+
+import(_LServer, mnesia, #vcard_xupdate{} = R) ->
+    mnesia:dirty_write(R);
+import(_LServer, riak, #vcard_xupdate{} = R) ->
+    ejabberd_riak:put(R, vcard_xupdate_schema());
+import(_, _, _) ->
+    pass.
+
+mod_opt_type(db_type) -> fun gen_mod:v_db/1;
+mod_opt_type(_) -> [db_type].

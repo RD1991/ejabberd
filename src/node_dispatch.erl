@@ -5,7 +5,7 @@
 %%% Created :  1 Dec 2007 by Christophe Romain <christophe.romain@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2016   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -34,19 +34,18 @@
 -author('christophe.romain@process-one.net').
 
 -include("pubsub.hrl").
--include("xmpp.hrl").
+-include("jlib.hrl").
 
 -export([init/3, terminate/2, options/0, features/0,
     create_node_permission/6, create_node/2, delete_node/1,
     purge_node/2, subscribe_node/8, unsubscribe_node/4,
-    publish_item/7, delete_item/4, remove_extra_items/3,
+    publish_item/6, delete_item/4, remove_extra_items/3,
     get_entity_affiliations/2, get_node_affiliations/1,
     get_affiliation/2, set_affiliation/3,
     get_entity_subscriptions/2, get_node_subscriptions/1,
     get_subscriptions/2, set_subscriptions/4,
     get_pending_nodes/2, get_states/1, get_state/2,
     set_state/1, get_items/7, get_items/3, get_item/7,
-    get_last_items/3,
     get_item/2, set_item/1, get_item_name/3, node_to_path/1,
     path_to_node/1]).
 
@@ -72,8 +71,7 @@ options() ->
 	{max_payload_size, ?MAX_PAYLOAD_SIZE},
 	{send_last_published_item, never},
 	{deliver_notifications, true},
-	{presence_based_delivery, false},
-	{itemreply, none}].
+	{presence_based_delivery, false}].
 
 features() ->
     [<<"create-nodes">>,
@@ -95,21 +93,18 @@ delete_node(Nodes) ->
 
 subscribe_node(_Nidx, _Sender, _Subscriber, _AccessModel, _SendLast, _PresenceSubscription,
 	    _RosterGroup, _Options) ->
-    {error, mod_pubsub:extended_error(xmpp:err_feature_not_implemented(),
-				      mod_pubsub:err_unsupported('subscribe'))}.
+    {error, ?ERR_FORBIDDEN}.
 
 unsubscribe_node(_Nidx, _Sender, _Subscriber, _SubId) ->
-    {error, mod_pubsub:extended_error(xmpp:err_feature_not_implemented(),
-				      mod_pubsub:err_unsupported('subscribe'))}.
+    {error, ?ERR_FORBIDDEN}.
 
-publish_item(Nidx, Publisher, PublishModel, MaxItems, ItemId, Payload,
-	     PubOpts) ->
+publish_item(Nidx, Publisher, PublishModel, MaxItems, ItemId, Payload) ->
     case nodetree_tree:get_node(Nidx) of
 	#pubsub_node{nodeid = {Host, Node}} ->
 	    lists:foreach(fun (SubNode) ->
 			node_hometree:publish_item(SubNode#pubsub_node.id,
 			    Publisher, PublishModel, MaxItems,
-			    ItemId, Payload, PubOpts)
+			    ItemId, Payload)
 		end,
 		nodetree_tree:get_subnodes(Host, Node, Publisher)),
 	    {result, {default, broadcast, []}};
@@ -121,12 +116,10 @@ remove_extra_items(_Nidx, _MaxItems, ItemIds) ->
     {result, {ItemIds, []}}.
 
 delete_item(_Nidx, _Publisher, _PublishModel, _ItemId) ->
-    {error, mod_pubsub:extended_error(xmpp:err_feature_not_implemented(),
-				      mod_pubsub:err_unsupported('delete-items'))}.
+    {error, ?ERR_ITEM_NOT_FOUND}.
 
 purge_node(_Nidx, _Owner) ->
-    {error, mod_pubsub:extended_error(xmpp:err_feature_not_implemented(),
-				      mod_pubsub:err_unsupported('purge-nodes'))}.
+    {error, ?ERR_FORBIDDEN}.
 
 get_entity_affiliations(_Host, _Owner) ->
     {result, []}.
@@ -170,9 +163,6 @@ get_items(Nidx, From, RSM) ->
 get_items(Nidx, JID, AccessModel, PresenceSubscription, RosterGroup, SubId, RSM) ->
     node_hometree:get_items(Nidx, JID, AccessModel,
 	PresenceSubscription, RosterGroup, SubId, RSM).
-
-get_last_items(Nidx, From, Count) ->
-    node_hometree:get_last_items(Nidx, From, Count).
 
 get_item(Nidx, ItemId) ->
     node_hometree:get_item(Nidx, ItemId).

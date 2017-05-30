@@ -5,7 +5,7 @@
 %%% Created : 10 Nov 2003 by Alexey Shchepin <alexey@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2016   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -27,11 +27,7 @@
 
 -author('alexey@process-one.net').
 
--ifndef(GEN_SERVER).
--define(GEN_SERVER, gen_server).
--endif.
--behaviour(?GEN_SERVER).
--behaviour(ejabberd_config).
+-behaviour(gen_server).
 
 %% API
 -export([start_link/4,
@@ -42,8 +38,7 @@
 	 starttls/2,
 	 compress/2,
 	 become_controller/2,
-	 close/1,
-	 opt_type/1]).
+	 close/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2,
@@ -56,10 +51,13 @@
 	{socket :: inet:socket() | fast_tls:tls_socket() | ezlib:zlib_socket(),
          sock_mod = gen_tcp :: gen_tcp | fast_tls | ezlib,
          shaper_state = none :: shaper:shaper(),
-         c2s_pid :: pid() | undefined,
+         c2s_pid :: pid(),
 	 max_stanza_size = infinity :: non_neg_integer() | infinity,
-         xml_stream_state :: fxml_stream:xml_stream_state() | undefined,
+         xml_stream_state :: fxml_stream:xml_stream_state(),
          timeout = infinity:: timeout()}).
+
+-define(HIBERNATE_TIMEOUT, ejabberd_config:get_option(receiver_hibernate, fun(X) when is_integer(X); X == hibernate-> X end, 90000)).
+
 
 -spec start_link(inet:socket(), atom(), shaper:shaper(),
                  non_neg_integer() | infinity) -> ignore |
@@ -67,7 +65,7 @@
                                                   {ok, pid()}.
 
 start_link(Socket, SockMod, Shaper, MaxStanzaSize) ->
-    ?GEN_SERVER:start_link(?MODULE,
+    gen_server:start_link(?MODULE,
 			  [Socket, SockMod, Shaper, MaxStanzaSize], []).
 
 -spec start(inet:socket(), atom(), shaper:shaper()) -> undefined | pid().
@@ -79,20 +77,20 @@ start(Socket, SockMod, Shaper) ->
             non_neg_integer() | infinity) -> undefined | pid().
 
 start(Socket, SockMod, Shaper, MaxStanzaSize) ->
-    {ok, Pid} = ?GEN_SERVER:start(ejabberd_receiver,
+    {ok, Pid} = gen_server:start(ejabberd_receiver,
 				 [Socket, SockMod, Shaper, MaxStanzaSize], []),
     Pid.
 
 -spec change_shaper(pid(), shaper:shaper()) -> ok.
 
 change_shaper(Pid, Shaper) ->
-    ?GEN_SERVER:cast(Pid, {change_shaper, Shaper}).
+    gen_server:cast(Pid, {change_shaper, Shaper}).
 
 -spec reset_stream(pid()) -> ok | {error, any()}.
 
 reset_stream(Pid) -> do_call(Pid, reset_stream).
 
--spec starttls(pid(), fast_tls:tls_socket()) -> ok | {error, any()}.
+-spec starttls(pid(), fast_tls:tls_socket()) -> ok.
 
 starttls(Pid, TLSSocket) ->
     do_call(Pid, {starttls, TLSSocket}).
@@ -111,7 +109,7 @@ become_controller(Pid, C2SPid) ->
 -spec close(pid()) -> ok.
 
 close(Pid) ->
-    ?GEN_SERVER:cast(Pid, close).
+    gen_server:cast(Pid, close).
 
 
 %%====================================================================
@@ -136,9 +134,9 @@ handle_call({starttls, TLSSocket}, _From, State) ->
     case fast_tls:recv_data(TLSSocket, <<"">>) of
 	{ok, TLSData} ->
 	    {reply, ok,
-		process_data(TLSData, NewState), hibernate_timeout()};
-	{error, _} = Err ->
-	    {stop, normal, Err, NewState}
+		process_data(TLSData, NewState), ?HIBERNATE_TIMEOUT};
+	{error, _Reason} ->
+	    {stop, normal, ok, NewState}
     end;
 handle_call({compress, Data}, _From,
 	    #state{socket = Socket, sock_mod = SockMod} =
@@ -155,31 +153,31 @@ handle_call({compress, Data}, _From,
     case ezlib:recv_data(ZlibSocket, <<"">>) of
       {ok, ZlibData} ->
 	    {reply, {ok, ZlibSocket},
-		process_data(ZlibData, NewState), hibernate_timeout()};
-      {error, _} = Err ->
-	    {stop, normal, Err, NewState}
+		process_data(ZlibData, NewState), ?HIBERNATE_TIMEOUT};
+      {error, _Reason} ->
+	    {stop, normal, ok, NewState}
     end;
 handle_call(reset_stream, _From, State) ->
     NewState = reset_parser(State),
     Reply = ok,
-    {reply, Reply, NewState, hibernate_timeout()};
+    {reply, Reply, NewState, ?HIBERNATE_TIMEOUT};
 handle_call({become_controller, C2SPid}, _From, State) ->
     XMLStreamState = fxml_stream:new(C2SPid, State#state.max_stanza_size),
     NewState = State#state{c2s_pid = C2SPid,
 			   xml_stream_state = XMLStreamState},
     activate_socket(NewState),
     Reply = ok,
-    {reply, Reply, NewState, hibernate_timeout()};
+    {reply, Reply, NewState, ?HIBERNATE_TIMEOUT};
 handle_call(_Request, _From, State) ->
-    Reply = ok, {reply, Reply, State, hibernate_timeout()}.
+    Reply = ok, {reply, Reply, State, ?HIBERNATE_TIMEOUT}.
 
 handle_cast({change_shaper, Shaper}, State) ->
     NewShaperState = shaper:new(Shaper),
     {noreply, State#state{shaper_state = NewShaperState},
-     hibernate_timeout()};
+     ?HIBERNATE_TIMEOUT};
 handle_cast(close, State) -> {stop, normal, State};
 handle_cast(_Msg, State) ->
-    {noreply, State, hibernate_timeout()}.
+    {noreply, State, ?HIBERNATE_TIMEOUT}.
 
 handle_info({Tag, _TCPSocket, Data},
 	    #state{socket = Socket, sock_mod = SockMod} = State)
@@ -190,7 +188,7 @@ handle_info({Tag, _TCPSocket, Data},
 	  case fast_tls:recv_data(Socket, Data) of
 	    {ok, TLSData} ->
 		{noreply, process_data(TLSData, State),
-		 hibernate_timeout()};
+		 ?HIBERNATE_TIMEOUT};
 	    {error, Reason} ->
 		  if is_binary(Reason) ->
 			  ?DEBUG("TLS error = ~s", [Reason]);
@@ -203,11 +201,11 @@ handle_info({Tag, _TCPSocket, Data},
 	  case ezlib:recv_data(Socket, Data) of
 	    {ok, ZlibData} ->
 		{noreply, process_data(ZlibData, State),
-		 hibernate_timeout()};
+		 ?HIBERNATE_TIMEOUT};
 	    {error, _Reason} -> {stop, normal, State}
 	  end;
       _ ->
-	  {noreply, process_data(Data, State), hibernate_timeout()}
+	  {noreply, process_data(Data, State), ?HIBERNATE_TIMEOUT}
     end;
 handle_info({Tag, _TCPSocket}, State)
     when (Tag == tcp_closed) or (Tag == ssl_closed) ->
@@ -215,18 +213,18 @@ handle_info({Tag, _TCPSocket}, State)
 handle_info({Tag, _TCPSocket, Reason}, State)
     when (Tag == tcp_error) or (Tag == ssl_error) ->
     case Reason of
-      timeout -> {noreply, State, hibernate_timeout()};
+      timeout -> {noreply, State, ?HIBERNATE_TIMEOUT};
       _ -> {stop, normal, State}
     end;
 handle_info({timeout, _Ref, activate}, State) ->
     activate_socket(State),
-    {noreply, State, hibernate_timeout()};
+    {noreply, State, ?HIBERNATE_TIMEOUT};
 handle_info(timeout, State) ->
-    proc_lib:hibernate(?GEN_SERVER, enter_loop,
+    proc_lib:hibernate(gen_server, enter_loop,
 		       [?MODULE, [], State]),
-    {noreply, State, hibernate_timeout()};
+    {noreply, State, ?HIBERNATE_TIMEOUT};
 handle_info(_Info, State) ->
-    {noreply, State, hibernate_timeout()}.
+    {noreply, State, ?HIBERNATE_TIMEOUT}.
 
 terminate(_Reason,
 	  #state{xml_stream_state = XMLStreamState,
@@ -248,15 +246,17 @@ code_change(_OldVsn, State, _Extra) -> {ok, State}.
 
 activate_socket(#state{socket = Socket,
 		       sock_mod = SockMod}) ->
-    Res = case SockMod of
-	      gen_tcp ->
-		  inet:setopts(Socket, [{active, once}]);
-	      _ ->
-		  SockMod:setopts(Socket, [{active, once}])
-	  end,
-    case Res of
+    PeerName = case SockMod of
+		 gen_tcp ->
+		     inet:setopts(Socket, [{active, once}]),
+		     inet:peername(Socket);
+		 _ ->
+		     SockMod:setopts(Socket, [{active, once}]),
+		     SockMod:peername(Socket)
+	       end,
+    case PeerName of
       {error, _Reason} -> self() ! {tcp_closed, Socket};
-      ok -> ok
+      {ok, _} -> ok
     end.
 
 %% Data processing for connectors directly generating xmlelement in
@@ -335,23 +335,7 @@ do_send(State, Data) ->
     (State#state.sock_mod):send(State#state.socket, Data).
 
 do_call(Pid, Msg) ->
-    try ?GEN_SERVER:call(Pid, Msg) of
-	Res -> Res
-    catch _:{timeout, _} ->
-	    {error, timeout};
-	  _:_ ->
-	    {error, einval}
+    case catch gen_server:call(Pid, Msg) of
+      {'EXIT', Why} -> {error, Why};
+      Res -> Res
     end.
-
-hibernate_timeout() ->
-    ejabberd_config:get_option(receiver_hibernate, timer:seconds(90)).
-
--spec opt_type(receiver_hibernate) -> fun((pos_integer() | hibernate) ->
-					   pos_integer() | hibernate);
-	      (atom()) -> [atom()].
-opt_type(receiver_hibernate) ->
-    fun(I) when is_integer(I), I>0 -> I;
-       (hibernate) -> hibernate
-    end;
-opt_type(_) ->
-    [receiver_hibernate].

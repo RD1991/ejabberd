@@ -1,11 +1,12 @@
 %%%-------------------------------------------------------------------
-%%% File    : mod_sip.erl
-%%% Author  : Evgeny Khramtsov <ekhramtsov@process-one.net>
-%%% Purpose : SIP RFC-3261
+%%% @author Evgeny Khramtsov <ekhramtsov@process-one.net>
+%%% @doc
+%%%
+%%% @end
 %%% Created : 21 Apr 2014 by Evgeny Khramtsov <ekhramtsov@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2014-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2014-2016   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -25,32 +26,18 @@
 -module(mod_sip).
 -protocol({rfc, 3261}).
 
--include("logger.hrl").
-
--ifndef(SIP).
--export([start/2, stop/1, depends/2, mod_opt_type/1]).
-start(_, _) ->
-    ?CRITICAL_MSG("ejabberd is not compiled with SIP support", []),
-    {error, sip_not_compiled}.
-stop(_) ->
-    ok.
-depends(_, _) ->
-    [].
-mod_opt_type(_) ->
-    [].
--else.
 -behaviour(gen_mod).
 -behaviour(esip).
 
 %% API
--export([start/2, stop/1, reload/3,
-	 make_response/2, is_my_host/1, at_my_host/1]).
+-export([start/2, stop/1, make_response/2, is_my_host/1, at_my_host/1]).
 
 -export([data_in/2, data_out/2, message_in/2,
 	 message_out/2, request/2, request/3, response/2,
-	 locate/1, mod_opt_type/1, depends/2]).
+	 locate/1, mod_opt_type/1]).
 
 -include("ejabberd.hrl").
+-include("logger.hrl").
 -include_lib("esip/include/esip.hrl").
 
 %%%===================================================================
@@ -68,18 +55,12 @@ start(_Host, _Opts) ->
 		  {ejabberd_tmp_sup, start_link,
 		   [mod_sip_proxy_sup, mod_sip_proxy]},
 		  permanent, infinity, supervisor, [ejabberd_tmp_sup]},
-    supervisor:start_child(ejabberd_gen_mod_sup, Spec),
-    supervisor:start_child(ejabberd_gen_mod_sup, TmpSupSpec),
+    supervisor:start_child(ejabberd_sup, Spec),
+    supervisor:start_child(ejabberd_sup, TmpSupSpec),
     ok.
 
 stop(_Host) ->
     ok.
-
-reload(_Host, _NewOpts, _OldOpts) ->
-    ok.
-
-depends(_Host, _Opts) ->
-    [].
 
 data_in(Data, #sip_socket{type = Transport,
                           addr = {MyIP, MyPort},
@@ -363,5 +344,3 @@ mod_opt_type(via) ->
 mod_opt_type(_) ->
     [always_record_route, flow_timeout_tcp,
      flow_timeout_udp, record_route, routes, via].
-
--endif.

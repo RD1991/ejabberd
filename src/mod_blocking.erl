@@ -5,7 +5,7 @@
 %%% Created : 24 Aug 2008 by Stephan Maka <stephan@spaceboyz.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2016   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -29,243 +29,413 @@
 
 -protocol({xep, 191, '1.2'}).
 
--export([start/2, stop/1, reload/3, process_iq/1, mod_opt_type/1, depends/2,
-	 disco_features/5]).
+-export([start/2, stop/1, process_iq/3,
+	 process_iq_set/4, process_iq_get/5, mod_opt_type/1]).
 
 -include("ejabberd.hrl").
 -include("logger.hrl").
 
--include("xmpp.hrl").
+-include("jlib.hrl").
 
 -include("mod_privacy.hrl").
 
 start(Host, Opts) ->
-    IQDisc = gen_mod:get_opt(iqdisc, Opts, gen_iq_handler:iqdisc(Host)),
-    ejabberd_hooks:add(disco_local_features, Host, ?MODULE, disco_features, 50),
+    IQDisc = gen_mod:get_opt(iqdisc, Opts, fun gen_iq_handler:check_type/1,
+                             one_queue),
+    ejabberd_hooks:add(privacy_iq_get, Host, ?MODULE,
+		       process_iq_get, 40),
+    ejabberd_hooks:add(privacy_iq_set, Host, ?MODULE,
+		       process_iq_set, 40),
+    mod_disco:register_feature(Host, ?NS_BLOCKING),
     gen_iq_handler:add_iq_handler(ejabberd_sm, Host,
 				  ?NS_BLOCKING, ?MODULE, process_iq, IQDisc).
 
 stop(Host) ->
-    ejabberd_hooks:delete(disco_local_features, Host, ?MODULE, disco_features, 50),
-    gen_iq_handler:remove_iq_handler(ejabberd_sm, Host, ?NS_BLOCKING).
+    ejabberd_hooks:delete(privacy_iq_get, Host, ?MODULE,
+			  process_iq_get, 40),
+    ejabberd_hooks:delete(privacy_iq_set, Host, ?MODULE,
+			  process_iq_set, 40),
+    mod_disco:unregister_feature(Host, ?NS_BLOCKING),
+    gen_iq_handler:remove_iq_handler(ejabberd_sm, Host,
+				     ?NS_BLOCKING).
 
-reload(Host, NewOpts, OldOpts) ->
-    case gen_mod:is_equal_opt(iqdisc, NewOpts, OldOpts, gen_iq_handler:iqdisc(Host)) of
-	{false, IQDisc, _} ->
-	    gen_iq_handler:add_iq_handler(ejabberd_sm, Host, ?NS_BLOCKING,
-					  ?MODULE, process_iq, IQDisc);
-	true ->
-	    ok
-    end.
+process_iq(_From, _To, IQ) ->
+    SubEl = IQ#iq.sub_el,
+    IQ#iq{type = error, sub_el = [SubEl, ?ERR_NOT_ALLOWED]}.
 
-depends(_Host, _Opts) ->
-    [{mod_privacy, hard}].
+process_iq_get(_, From, _To,
+	       #iq{xmlns = ?NS_BLOCKING,
+		   sub_el = #xmlel{name = <<"blocklist">>}},
+	       _) ->
+    #jid{luser = LUser, lserver = LServer} = From,
+    {stop, process_blocklist_get(LUser, LServer)};
+process_iq_get(Acc, _, _, _, _) -> Acc.
 
--spec disco_features({error, stanza_error()} | {result, [binary()]} | empty,
-		     jid(), jid(), binary(), binary()) ->
-			    {error, stanza_error()} | {result, [binary()]}.
-disco_features({error, Err}, _From, _To, _Node, _Lang) ->
-    {error, Err};
-disco_features(empty, _From, _To, <<"">>, _Lang) ->
-    {result, [?NS_BLOCKING]};
-disco_features({result, Feats}, _From, _To, <<"">>, _Lang) ->
-    {result, [?NS_BLOCKING|Feats]};
-disco_features(Acc, _From, _To, _Node, _Lang) ->
-    Acc.
+process_iq_set(_, From, _To,
+	       #iq{xmlns = ?NS_BLOCKING,
+		   sub_el =
+		       #xmlel{name = SubElName, children = SubEls}}) ->
+    #jid{luser = LUser, lserver = LServer} = From,
+    Res = case {SubElName, fxml:remove_cdata(SubEls)} of
+	    {<<"block">>, []} -> {error, ?ERR_BAD_REQUEST};
+	    {<<"block">>, Els} ->
+		JIDs = parse_blocklist_items(Els, []),
+		process_blocklist_block(LUser, LServer, JIDs);
+	    {<<"unblock">>, []} ->
+		process_blocklist_unblock_all(LUser, LServer);
+	    {<<"unblock">>, Els} ->
+		JIDs = parse_blocklist_items(Els, []),
+		process_blocklist_unblock(LUser, LServer, JIDs);
+	    _ -> {error, ?ERR_BAD_REQUEST}
+	  end,
+    {stop, Res};
+process_iq_set(Acc, _, _, _) -> Acc.
 
--spec process_iq(iq()) -> iq().
-process_iq(#iq{type = Type,
-	       from = #jid{luser = U, lserver = S},
-	       to = #jid{luser = U, lserver = S}} = IQ) ->
-    case Type of
-	get -> process_iq_get(IQ);
-	set -> process_iq_set(IQ)
-    end;
-process_iq(#iq{lang = Lang} = IQ) ->
-    Txt = <<"Query to another users is forbidden">>,
-    xmpp:make_error(IQ, xmpp:err_forbidden(Txt, Lang)).
-
--spec process_iq_get(iq()) -> iq().
-process_iq_get(#iq{sub_els = [#block_list{}]} = IQ) ->
-    process_get(IQ);
-process_iq_get(#iq{lang = Lang} = IQ) ->
-    Txt = <<"No module is handling this query">>,
-    xmpp:make_error(IQ, xmpp:err_service_unavailable(Txt, Lang)).
-
--spec process_iq_set(iq()) -> iq().
-process_iq_set(#iq{lang = Lang, sub_els = [SubEl]} = IQ) ->
-    case SubEl of
-	#block{items = []} ->
-	    Txt = <<"No items found in this query">>,
-	    xmpp:make_error(IQ, xmpp:err_bad_request(Txt, Lang));
-	#block{items = Items} ->
-	    JIDs = [jid:tolower(Item) || Item <- Items],
-	    process_block(IQ, JIDs);
-	#unblock{items = []} ->
-	    process_unblock_all(IQ);
-	#unblock{items = Items} ->
-	    JIDs = [jid:tolower(Item) || Item <- Items],
-	    process_unblock(IQ, JIDs);
-	_ ->
-	    Txt = <<"No module is handling this query">>,
-	    xmpp:make_error(IQ, xmpp:err_service_unavailable(Txt, Lang))
-    end.
-
--spec listitems_to_jids([listitem()], [ljid()]) -> [ljid()].
-listitems_to_jids([], JIDs) ->
-    JIDs;
-listitems_to_jids([#listitem{type = jid,
-			     action = deny, value = JID} = Item | Items],
+list_to_blocklist_jids([], JIDs) -> JIDs;
+list_to_blocklist_jids([#listitem{type = jid,
+				  action = deny, value = JID} =
+			    Item
+			| Items],
 		       JIDs) ->
-    Match = case Item of
-		#listitem{match_all = true} ->
-		    true;
-		#listitem{match_iq = true,
-			  match_message = true,
-			  match_presence_in = true,
-			  match_presence_out = true} ->
-		    true;
-		_ ->
-		    false
-	    end,
-    if Match -> listitems_to_jids(Items, [JID | JIDs]);
-       true -> listitems_to_jids(Items, JIDs)
+    case Item of
+      #listitem{match_all = true} -> Match = true;
+      #listitem{match_iq = true, match_message = true,
+		match_presence_in = true, match_presence_out = true} ->
+	  Match = true;
+      _ -> Match = false
+    end,
+    if Match -> list_to_blocklist_jids(Items, [JID | JIDs]);
+       true -> list_to_blocklist_jids(Items, JIDs)
     end;
 % Skip Privacy List items than cannot be mapped to Blocking items
-listitems_to_jids([_ | Items], JIDs) ->
-    listitems_to_jids(Items, JIDs).
+list_to_blocklist_jids([_ | Items], JIDs) ->
+    list_to_blocklist_jids(Items, JIDs).
 
--spec process_block(iq(), [ljid()]) -> iq().
-process_block(#iq{from = From} = IQ, LJIDs) ->
-    #jid{luser = LUser, lserver = LServer} = From,
-    case mod_privacy:get_user_list(LUser, LServer, default) of
-	{error, _} ->
-	    err_db_failure(IQ);
-	Res ->
-	    {Name, List} = case Res of
-			       error -> {<<"Blocked contacts">>, []};
-			       {ok, NameList} -> NameList
-			   end,
-	    AlreadyBlocked = listitems_to_jids(List, []),
-	    NewList = lists:foldr(
-			fun(LJID, List1) ->
-				case lists:member(LJID, AlreadyBlocked) of
-				    true ->
-					List1;
-				    false ->
-					[#listitem{type = jid,
-						   value = LJID,
-						   action = deny,
-						   order = 0,
-						   match_all = true}|List1]
-				end
-			end, List, LJIDs),
-	    case mod_privacy:set_list(LUser, LServer, Name, NewList) of
-		ok ->
-		    case (if Res == error ->
-				  mod_privacy:set_default_list(
-				    LUser, LServer, Name);
-			     true ->
-				  ok
-			  end) of
-			ok ->
-			    mod_privacy:push_list_update(From, Name),
-			    Items = [jid:make(LJID) || LJID <- LJIDs],
-			    broadcast_event(From, #block{items = Items}),
-			    xmpp:make_iq_result(IQ);
-			{error, notfound} ->
-			    ?ERROR_MSG("Failed to set default list '~s': "
-				       "the list should exist, but not found",
-				       [Name]),
-			    err_db_failure(IQ);
-			{error, _} ->
-			    err_db_failure(IQ)
-		    end;
-		{error, _} ->
-		    err_db_failure(IQ)
-	    end
+parse_blocklist_items([], JIDs) -> JIDs;
+parse_blocklist_items([#xmlel{name = <<"item">>,
+			      attrs = Attrs}
+		       | Els],
+		      JIDs) ->
+    case fxml:get_attr(<<"jid">>, Attrs) of
+      {value, JID1} ->
+	  JID = jid:tolower(jid:from_string(JID1)),
+	  parse_blocklist_items(Els, [JID | JIDs]);
+      false -> parse_blocklist_items(Els, JIDs)
+    end;
+parse_blocklist_items([_ | Els], JIDs) ->
+    parse_blocklist_items(Els, JIDs).
+
+process_blocklist_block(LUser, LServer, JIDs) ->
+    Filter = fun (List) ->
+		     AlreadyBlocked = list_to_blocklist_jids(List, []),
+		     lists:foldr(fun (JID, List1) ->
+					 case lists:member(JID, AlreadyBlocked)
+					     of
+					   true -> List1;
+					   false ->
+					       [#listitem{type = jid,
+							  value = JID,
+							  action = deny,
+							  order = 0,
+							  match_all = true}
+						| List1]
+					 end
+				 end,
+				 List, JIDs)
+	     end,
+    case process_blocklist_block(LUser, LServer, Filter,
+				 gen_mod:db_type(LServer, mod_privacy))
+	of
+      {atomic, {ok, Default, List}} ->
+	  UserList = make_userlist(Default, List),
+	  broadcast_list_update(LUser, LServer, Default,
+				UserList),
+	  broadcast_blocklist_event(LUser, LServer,
+				    {block, JIDs}),
+	  {result, [], UserList};
+      _Err ->
+	    ?ERROR_MSG("Error processing ~p: ~p", [{LUser, LServer, JIDs}, _Err]),
+	    {error, ?ERR_INTERNAL_SERVER_ERROR}
     end.
 
--spec process_unblock_all(iq()) -> iq().
-process_unblock_all(#iq{from = From} = IQ) ->
-    #jid{luser = LUser, lserver = LServer} = From,
-    case mod_privacy:get_user_list(LUser, LServer, default) of
-	{ok, {Name, List}} ->
-	    NewList = lists:filter(
-			fun(#listitem{action = A}) ->
-				A /= deny
-			end, List),
-	    case mod_privacy:set_list(LUser, LServer, Name, NewList) of
-		ok ->
-		    mod_privacy:push_list_update(From, Name),
-		    broadcast_event(From, #unblock{}),
-		    xmpp:make_iq_result(IQ);
-		{error, _} ->
-		    err_db_failure(IQ)
-	    end;
-	error ->
-	    broadcast_event(From, #unblock{}),
-	    xmpp:make_iq_result(IQ);
-	{error, _} ->
-	    err_db_failure(IQ)
+process_blocklist_block(LUser, LServer, Filter,
+			mnesia) ->
+    F = fun () ->
+		case mnesia:wread({privacy, {LUser, LServer}}) of
+		  [] ->
+		      P = #privacy{us = {LUser, LServer}},
+		      NewDefault = <<"Blocked contacts">>,
+		      NewLists1 = [],
+		      List = [];
+		  [#privacy{default = Default, lists = Lists} = P] ->
+		      case lists:keysearch(Default, 1, Lists) of
+			{value, {_, List}} ->
+			    NewDefault = Default,
+			    NewLists1 = lists:keydelete(Default, 1, Lists);
+			false ->
+			    NewDefault = <<"Blocked contacts">>,
+			    NewLists1 = Lists,
+			    List = []
+		      end
+		end,
+		NewList = Filter(List),
+		NewLists = [{NewDefault, NewList} | NewLists1],
+		mnesia:write(P#privacy{default = NewDefault,
+				       lists = NewLists}),
+		{ok, NewDefault, NewList}
+	end,
+    mnesia:transaction(F);
+process_blocklist_block(LUser, LServer, Filter,
+			riak) ->
+    {atomic,
+     begin
+         case ejabberd_riak:get(privacy, mod_privacy:privacy_schema(),
+				{LUser, LServer}) of
+             {ok, #privacy{default = Default, lists = Lists} = P} ->
+                 case lists:keysearch(Default, 1, Lists) of
+                     {value, {_, List}} ->
+                         NewDefault = Default,
+                         NewLists1 = lists:keydelete(Default, 1, Lists);
+                     false ->
+                         NewDefault = <<"Blocked contacts">>,
+                         NewLists1 = Lists,
+                         List = []
+                 end;
+             {error, _} ->
+                 P = #privacy{us = {LUser, LServer}},
+                 NewDefault = <<"Blocked contacts">>,
+                 NewLists1 = [],
+                 List = []
+         end,
+         NewList = Filter(List),
+         NewLists = [{NewDefault, NewList} | NewLists1],
+         case ejabberd_riak:put(P#privacy{default = NewDefault,
+                                          lists = NewLists},
+				mod_privacy:privacy_schema()) of
+             ok ->
+                 {ok, NewDefault, NewList};
+             Err ->
+                 Err
+         end
+     end};
+process_blocklist_block(LUser, LServer, Filter, odbc) ->
+    F = fun () ->
+		Default = case
+			    mod_privacy:sql_get_default_privacy_list_t(LUser)
+			      of
+			    {selected, []} ->
+				Name = <<"Blocked contacts">>,
+				mod_privacy:sql_add_privacy_list(LUser, Name),
+				mod_privacy:sql_set_default_privacy_list(LUser,
+									 Name),
+				Name;
+			    {selected, [{Name}]} -> Name
+			  end,
+		{selected, [{ID}]} =
+		    mod_privacy:sql_get_privacy_list_id_t(LUser, Default),
+		case mod_privacy:sql_get_privacy_list_data_by_id_t(ID) of
+		  {selected, RItems = [_ | _]} ->
+		      List = lists:flatmap(fun mod_privacy:raw_to_item/1, RItems);
+		  _ -> List = []
+		end,
+		NewList = Filter(List),
+		NewRItems = lists:map(fun mod_privacy:item_to_raw/1,
+				      NewList),
+		mod_privacy:sql_set_privacy_list(ID, NewRItems),
+		{ok, Default, NewList}
+	end,
+    ejabberd_odbc:sql_transaction(LServer, F).
+
+process_blocklist_unblock_all(LUser, LServer) ->
+    Filter = fun (List) ->
+		     lists:filter(fun (#listitem{action = A}) -> A =/= deny
+				  end,
+				  List)
+	     end,
+    DBType = gen_mod:db_type(LServer, mod_privacy),
+    case unblock_by_filter(LUser, LServer, Filter, DBType) of
+      {atomic, ok} -> {result, []};
+      {atomic, {ok, Default, List}} ->
+	  UserList = make_userlist(Default, List),
+	  broadcast_list_update(LUser, LServer, Default,
+				UserList),
+	  broadcast_blocklist_event(LUser, LServer, unblock_all),
+	  {result, [], UserList};
+      _Err ->
+	    ?ERROR_MSG("Error processing ~p: ~p", [{LUser, LServer}, _Err]),
+	    {error, ?ERR_INTERNAL_SERVER_ERROR}
     end.
 
--spec process_unblock(iq(), [ljid()]) -> iq().
-process_unblock(#iq{from = From} = IQ, LJIDs) ->
-    #jid{luser = LUser, lserver = LServer} = From,
-    case mod_privacy:get_user_list(LUser, LServer, default) of
-	{ok, {Name, List}} ->
-	    NewList = lists:filter(
-			fun(#listitem{action = deny, type = jid,
-				      value = LJID}) ->
-				not lists:member(LJID, LJIDs);
-			   (_) ->
-				true
-			end, List),
-	    case mod_privacy:set_list(LUser, LServer, Name, NewList) of
-		ok ->
-		    mod_privacy:push_list_update(From, Name),
-		    Items = [jid:make(LJID) || LJID <- LJIDs],
-		    broadcast_event(From, #unblock{items = Items}),
-		    xmpp:make_iq_result(IQ);
-		{error, _} ->
-		    err_db_failure(IQ)
-	    end;
-	error ->
-	    Items = [jid:make(LJID) || LJID <- LJIDs],
-	    broadcast_event(From, #unblock{items = Items}),
-	    xmpp:make_iq_result(IQ);
-	{error, _} ->
-	    err_db_failure(IQ)
+process_blocklist_unblock(LUser, LServer, JIDs) ->
+    Filter = fun (List) ->
+		     lists:filter(fun (#listitem{action = deny, type = jid,
+						 value = JID}) ->
+					  not lists:member(JID, JIDs);
+				      (_) -> true
+				  end,
+				  List)
+	     end,
+    DBType = gen_mod:db_type(LServer, mod_privacy),
+    case unblock_by_filter(LUser, LServer, Filter, DBType) of
+      {atomic, ok} -> {result, []};
+      {atomic, {ok, Default, List}} ->
+	  UserList = make_userlist(Default, List),
+	  broadcast_list_update(LUser, LServer, Default,
+				UserList),
+	  broadcast_blocklist_event(LUser, LServer,
+				    {unblock, JIDs}),
+	  {result, [], UserList};
+      _Err ->
+	    ?ERROR_MSG("Error processing ~p: ~p", [{LUser, LServer, JIDs}, _Err]),
+	    {error, ?ERR_INTERNAL_SERVER_ERROR}
     end.
 
--spec broadcast_event(jid(), block() | unblock()) -> ok.
-broadcast_event(#jid{luser = LUser, lserver = LServer} = From, Event) ->
-    lists:foreach(
-      fun(R) ->
-	      To = jid:replace_resource(From, R),
-	      IQ = #iq{type = set, from = From, to = To,
-		       id = <<"push", (randoms:get_string())/binary>>,
-		       sub_els = [Event]},
-	      ejabberd_router:route(IQ)
-      end, ejabberd_sm:get_user_resources(LUser, LServer)).
+unblock_by_filter(LUser, LServer, Filter, mnesia) ->
+    F = fun () ->
+		case mnesia:read({privacy, {LUser, LServer}}) of
+		  [] ->
+		      % No lists, nothing to unblock
+		      ok;
+		  [#privacy{default = Default, lists = Lists} = P] ->
+		      case lists:keysearch(Default, 1, Lists) of
+			{value, {_, List}} ->
+			    NewList = Filter(List),
+			    NewLists1 = lists:keydelete(Default, 1, Lists),
+			    NewLists = [{Default, NewList} | NewLists1],
+			    mnesia:write(P#privacy{lists = NewLists}),
+			    {ok, Default, NewList};
+			false ->
+			    % No default list, nothing to unblock
+			    ok
+		      end
+		end
+	end,
+    mnesia:transaction(F);
+unblock_by_filter(LUser, LServer, Filter, riak) ->
+    {atomic,
+     case ejabberd_riak:get(privacy, mod_privacy:privacy_schema(),
+			    {LUser, LServer}) of
+         {error, _} ->
+             %% No lists, nothing to unblock
+             ok;
+         {ok, #privacy{default = Default, lists = Lists} = P} ->
+             case lists:keysearch(Default, 1, Lists) of
+                 {value, {_, List}} ->
+                     NewList = Filter(List),
+                     NewLists1 = lists:keydelete(Default, 1, Lists),
+                     NewLists = [{Default, NewList} | NewLists1],
+                     case ejabberd_riak:put(P#privacy{lists = NewLists},
+					    mod_privacy:privacy_schema()) of
+                         ok ->
+                             {ok, Default, NewList};
+                         Err ->
+                             Err
+                     end;
+                 false ->
+                     %% No default list, nothing to unblock
+                     ok
+             end
+     end};
+unblock_by_filter(LUser, LServer, Filter, odbc) ->
+    F = fun () ->
+		case mod_privacy:sql_get_default_privacy_list_t(LUser)
+		    of
+		  {selected, []} -> ok;
+		  {selected, [{Default}]} ->
+		      {selected, [{ID}]} =
+			  mod_privacy:sql_get_privacy_list_id_t(LUser, Default),
+		      case mod_privacy:sql_get_privacy_list_data_by_id_t(ID) of
+			{selected, RItems = [_ | _]} ->
+			    List = lists:flatmap(fun mod_privacy:raw_to_item/1,
+                                                 RItems),
+			    NewList = Filter(List),
+			    NewRItems = lists:map(fun mod_privacy:item_to_raw/1,
+						  NewList),
+			    mod_privacy:sql_set_privacy_list(ID, NewRItems),
+			    {ok, Default, NewList};
+			_ -> ok
+		      end;
+		  _ -> ok
+		end
+	end,
+    ejabberd_odbc:sql_transaction(LServer, F).
 
--spec process_get(iq()) -> iq().
-process_get(#iq{from = #jid{luser = LUser, lserver = LServer}} = IQ) ->
-    case mod_privacy:get_user_list(LUser, LServer, default) of
-	{ok, {_, List}} ->
-	    LJIDs = listitems_to_jids(List, []),
-	    Items = [jid:make(J) || J <- LJIDs],
-	    xmpp:make_iq_result(IQ, #block_list{items = Items});
-	error ->
-	    xmpp:make_iq_result(IQ, #block_list{});
-	{error, _} ->
-	    err_db_failure(IQ)
+make_userlist(Name, List) ->
+    NeedDb = mod_privacy:is_list_needdb(List),
+    #userlist{name = Name, list = List, needdb = NeedDb}.
+
+broadcast_list_update(LUser, LServer, Name, UserList) ->
+    ejabberd_sm:route(jid:make(LUser, LServer,
+                                    <<"">>),
+                      jid:make(LUser, LServer, <<"">>),
+                      {broadcast, {privacy_list, UserList, Name}}).
+
+broadcast_blocklist_event(LUser, LServer, Event) ->
+    JID = jid:make(LUser, LServer, <<"">>),
+    ejabberd_sm:route(JID, JID,
+                      {broadcast, {blocking, Event}}).
+
+process_blocklist_get(LUser, LServer) ->
+    case process_blocklist_get(LUser, LServer,
+			       gen_mod:db_type(LServer, mod_privacy))
+	of
+      error -> {error, ?ERR_INTERNAL_SERVER_ERROR};
+      List ->
+	  JIDs = list_to_blocklist_jids(List, []),
+	  Items = lists:map(fun (JID) ->
+				    ?DEBUG("JID: ~p", [JID]),
+				    #xmlel{name = <<"item">>,
+					   attrs =
+					       [{<<"jid">>,
+						 jid:to_string(JID)}],
+					   children = []}
+			    end,
+			    JIDs),
+	  {result,
+	   [#xmlel{name = <<"blocklist">>,
+		   attrs = [{<<"xmlns">>, ?NS_BLOCKING}],
+		   children = Items}]}
     end.
 
-err_db_failure(#iq{lang = Lang} = IQ) ->
-    Txt = <<"Database failure">>,
-    xmpp:make_error(IQ, xmpp:err_internal_server_error(Txt, Lang)).
+process_blocklist_get(LUser, LServer, mnesia) ->
+    case catch mnesia:dirty_read(privacy, {LUser, LServer})
+	of
+      {'EXIT', _Reason} -> error;
+      [] -> [];
+      [#privacy{default = Default, lists = Lists}] ->
+	  case lists:keysearch(Default, 1, Lists) of
+	    {value, {_, List}} -> List;
+	    _ -> []
+	  end
+    end;
+process_blocklist_get(LUser, LServer, riak) ->
+    case ejabberd_riak:get(privacy, mod_privacy:privacy_schema(),
+			   {LUser, LServer}) of
+        {ok, #privacy{default = Default, lists = Lists}} ->
+            case lists:keysearch(Default, 1, Lists) of
+                {value, {_, List}} -> List;
+                _ -> []
+            end;
+        {error, notfound} ->
+            [];
+        {error, _} ->
+            error
+    end;
+process_blocklist_get(LUser, LServer, odbc) ->
+    case catch
+	   mod_privacy:sql_get_default_privacy_list(LUser, LServer)
+	of
+      {selected, []} -> [];
+      {selected, [{Default}]} ->
+	  case catch mod_privacy:sql_get_privacy_list_data(LUser,
+							   LServer, Default)
+	      of
+	    {selected, RItems} ->
+		lists:flatmap(fun mod_privacy:raw_to_item/1, RItems);
+	    {'EXIT', _} -> error
+	  end;
+      {'EXIT', _} -> error
+    end.
 
 mod_opt_type(iqdisc) -> fun gen_iq_handler:check_type/1;
 mod_opt_type(_) -> [iqdisc].

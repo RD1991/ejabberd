@@ -5,7 +5,7 @@
 %%% Created : 15 Jun 2009 by Brian Cully <bjc@kublai.com>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2016   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -28,19 +28,18 @@
 -author('bjc@kublai.com').
 
 -include("pubsub.hrl").
--include("xmpp.hrl").
+-include("jlib.hrl").
 
 -export([init/3, terminate/2, options/0, features/0,
     create_node_permission/6, create_node/2, delete_node/1,
     purge_node/2, subscribe_node/8, unsubscribe_node/4,
-    publish_item/7, delete_item/4, remove_extra_items/3,
+    publish_item/6, delete_item/4, remove_extra_items/3,
     get_entity_affiliations/2, get_node_affiliations/1,
     get_affiliation/2, set_affiliation/3,
     get_entity_subscriptions/2, get_node_subscriptions/1,
     get_subscriptions/2, set_subscriptions/4,
     get_pending_nodes/2, get_states/1, get_state/2,
     set_state/1, get_items/7, get_items/3, get_item/7,
-    get_last_items/3,
     get_item/2, set_item/1, get_item_name/3, node_to_path/1,
     path_to_node/1]).
 
@@ -73,18 +72,16 @@ subscribe_node(Nidx, Sender, Subscriber, AccessModel,
 unsubscribe_node(Nidx, Sender, Subscriber, SubId) ->
     node_hometree:unsubscribe_node(Nidx, Sender, Subscriber, SubId).
 
-publish_item(Nidx, Publisher, Model, MaxItems, ItemId, Payload, PubOpts) ->
+publish_item(Nidx, Publisher, Model, MaxItems, ItemId, Payload) ->
     case nodetree_dag:get_node(Nidx) of
 	#pubsub_node{options = Options} ->
 	    case find_opt(node_type, Options) of
 		collection ->
-		    Txt = <<"Publishing items to collection node is not allowed">>,
-		    {error, mod_pubsub:extended_error(
-			      xmpp:err_not_allowed(Txt, ?MYLANG),
-			      mod_pubsub:err_unsupported('publish'))};
+		    {error,
+			?ERR_EXTENDED((?ERR_NOT_ALLOWED), <<"publish">>)};
 		_ ->
 		    node_hometree:publish_item(Nidx, Publisher, Model,
-			MaxItems, ItemId, Payload, PubOpts)
+			MaxItems, ItemId, Payload)
 	    end;
 	Err -> Err
     end.
@@ -144,9 +141,6 @@ get_items(Nidx, From, RSM) ->
 get_items(Nidx, JID, AccessModel, PresenceSubscription, RosterGroup, SubId, RSM) ->
     node_hometree:get_items(Nidx, JID, AccessModel,
 	PresenceSubscription, RosterGroup, SubId, RSM).
-
-get_last_items(Nidx, From, Count) ->
-    node_hometree:get_last_items(Nidx, From, Count).
 
 get_item(Nidx, ItemId) ->
     node_hometree:get_item(Nidx, ItemId).

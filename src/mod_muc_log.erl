@@ -5,7 +5,7 @@
 %%% Created : 12 Mar 2006 by Alexey Shchepin <alexey@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2016   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -27,6 +27,8 @@
 
 -protocol({xep, 334, '0.2'}).
 
+-behaviour(ejabberd_config).
+
 -author('badlop@process-one.net').
 
 -behaviour(gen_server).
@@ -34,20 +36,22 @@
 -behaviour(gen_mod).
 
 %% API
--export([start/2, stop/1, reload/3, transform_module_options/1,
+-export([start_link/2, start/2, stop/1, transform_module_options/1,
 	 check_access_log/2, add_to_log/5]).
 
 -export([init/1, handle_call/3, handle_cast/2,
 	 handle_info/2, terminate/2, code_change/3,
-	 mod_opt_type/1, depends/2]).
+	 mod_opt_type/1, opt_type/1]).
 
 -include("ejabberd.hrl").
 -include("logger.hrl").
 
--include("xmpp.hrl").
+-include("jlib.hrl").
+-include("mod_muc.hrl").
 -include("mod_muc_room.hrl").
 
 -define(T(Text), translate:translate(Lang, Text)).
+-define(PROCNAME, ejabberd_mod_muc_log).
 -record(room, {jid, title, subject, subject_author, config}).
 
 -define(PLAINTEXT_CO, <<"ZZCZZ">>).
@@ -70,15 +74,20 @@
 %%====================================================================
 %% API
 %%====================================================================
+start_link(Host, Opts) ->
+    Proc = gen_mod:get_module_proc(Host, ?PROCNAME),
+    gen_server:start_link({local, Proc}, ?MODULE, [Host, Opts], []).
+
 start(Host, Opts) ->
-    gen_mod:start_child(?MODULE, Host, Opts).
+    Proc = gen_mod:get_module_proc(Host, ?PROCNAME),
+    ChildSpec = {Proc, {?MODULE, start_link, [Host, Opts]},
+		 temporary, 1000, worker, [?MODULE]},
+    supervisor:start_child(ejabberd_sup, ChildSpec).
 
 stop(Host) ->
-    gen_mod:stop_child(?MODULE, Host).
-
-reload(Host, NewOpts, _OldOpts) ->
-    Proc = get_proc_name(Host),
-    gen_server:cast(Proc, {reload, NewOpts}).
+    Proc = gen_mod:get_module_proc(Host, ?PROCNAME),
+    gen_server:call(Proc, stop),
+    supervisor:delete_child(ejabberd_sup, Proc).
 
 add_to_log(Host, Type, Data, Room, Opts) ->
     gen_server:cast(get_proc_name(Host),
@@ -100,15 +109,63 @@ transform_module_options(Opts) ->
               Opt
       end, Opts).
 
-depends(_Host, _Opts) ->
-    [{mod_muc, hard}].
-
 %%====================================================================
 %% gen_server callbacks
 %%====================================================================
 init([Host, Opts]) ->
-    process_flag(trap_exit, true),
-    {ok, init_state(Host, Opts)}.
+    OutDir = gen_mod:get_opt(outdir, Opts,
+                             fun iolist_to_binary/1,
+                             <<"www/muc">>),
+    DirType = gen_mod:get_opt(dirtype, Opts,
+                              fun(subdirs) -> subdirs;
+                                 (plain) -> plain
+                              end, subdirs),
+    DirName = gen_mod:get_opt(dirname, Opts,
+                              fun(room_jid) -> room_jid;
+                                 (room_name) -> room_name
+                              end, room_jid),
+    FileFormat = gen_mod:get_opt(file_format, Opts,
+                                 fun(html) -> html;
+                                    (plaintext) -> plaintext
+                                 end, html),
+    FilePermissions = gen_mod:get_opt(file_permissions, Opts,
+                                 fun(SubOpts) ->
+                                         F = fun({mode, Mode}, {_M, G}) ->
+                                                        {Mode, G};
+                                                ({group, Group}, {M, _G}) ->
+                                                        {M, Group}
+                                             end,
+                                         lists:foldl(F, {644, 33}, SubOpts)
+                                 end, {644, 33}),
+    CSSFile = gen_mod:get_opt(cssfile, Opts,
+                              fun iolist_to_binary/1,
+                              false),
+    AccessLog = gen_mod:get_opt(access_log, Opts,
+                                fun(A) when is_atom(A) -> A end,
+                                muc_admin),
+    Timezone = gen_mod:get_opt(timezone, Opts,
+                               fun(local) -> local;
+                                  (universal) -> universal
+                               end, local),
+    Top_link = gen_mod:get_opt(top_link, Opts,
+                               fun([{S1, S2}]) ->
+                                       {iolist_to_binary(S1),
+                                        iolist_to_binary(S2)}
+                               end, {<<"/">>, <<"Home">>}),
+    NoFollow = gen_mod:get_opt(spam_prevention, Opts,
+                               fun(B) when is_boolean(B) -> B end,
+                               true),
+    Lang = ejabberd_config:get_option(
+             {language, Host},
+             fun iolist_to_binary/1,
+             ?MYLANG),
+    {ok,
+     #logstate{host = Host, out_dir = OutDir,
+	       dir_type = DirType, dir_name = DirName,
+	       file_format = FileFormat, css_file = CSSFile,
+	       file_permissions = FilePermissions,
+	       access = AccessLog, lang = Lang, timezone = Timezone,
+	       spam_prevention = NoFollow, top_link = Top_link}}.
 
 handle_call({check_access_log, ServerHost, FromJID}, _From, State) ->
     Reply = acl:match_rule(ServerHost, State#logstate.access, FromJID),
@@ -116,17 +173,13 @@ handle_call({check_access_log, ServerHost, FromJID}, _From, State) ->
 handle_call(stop, _From, State) ->
     {stop, normal, ok, State}.
 
-handle_cast({reload, Opts}, #logstate{host = Host}) ->
-    {noreply, init_state(Host, Opts)};
 handle_cast({add_to_log, Type, Data, Room, Opts}, State) ->
     case catch add_to_log2(Type, Data, Room, Opts, State) of
       {'EXIT', Reason} -> ?ERROR_MSG("~p", [Reason]);
       _ -> ok
     end,
     {noreply, State};
-handle_cast(Msg, State) ->
-    ?WARNING_MSG("unexpected cast: ~p", [Msg]),
-    {noreply, State}.
+handle_cast(_Msg, State) -> {noreply, State}.
 
 handle_info(_Info, State) -> {noreply, State}.
 
@@ -137,35 +190,18 @@ code_change(_OldVsn, State, _Extra) -> {ok, State}.
 %%--------------------------------------------------------------------
 %%% Internal functions
 %%--------------------------------------------------------------------
-init_state(Host, Opts) ->
-    OutDir = gen_mod:get_opt(outdir, Opts, <<"www/muc">>),
-    DirType = gen_mod:get_opt(dirtype, Opts, subdirs),
-    DirName = gen_mod:get_opt(dirname, Opts, room_jid),
-    FileFormat = gen_mod:get_opt(file_format, Opts, html),
-    FilePermissions = gen_mod:get_opt(file_permissions, Opts, {644, 33}),
-    CSSFile = gen_mod:get_opt(cssfile, Opts, false),
-    AccessLog = gen_mod:get_opt(access_log, Opts, muc_admin),
-    Timezone = gen_mod:get_opt(timezone, Opts, local),
-    Top_link = gen_mod:get_opt(top_link, Opts, {<<"/">>, <<"Home">>}),
-    NoFollow = gen_mod:get_opt(spam_prevention, Opts, true),
-    Lang = ejabberd_config:get_lang(Host),
-    #logstate{host = Host, out_dir = OutDir,
-	      dir_type = DirType, dir_name = DirName,
-	      file_format = FileFormat, css_file = CSSFile,
-	      file_permissions = FilePermissions,
-	      access = AccessLog, lang = Lang, timezone = Timezone,
-	      spam_prevention = NoFollow, top_link = Top_link}.
-
 add_to_log2(text, {Nick, Packet}, Room, Opts, State) ->
     case has_no_permanent_store_hint(Packet) of
 	false ->
-	    case {Packet#message.subject, Packet#message.body} of
-		{[], []} -> ok;
-		{[], Body} ->
-		    Message = {body, xmpp:get_text(Body)},
+	    case {fxml:get_subtag(Packet, <<"subject">>),
+		    fxml:get_subtag(Packet, <<"body">>)}
+	    of
+		{false, false} -> ok;
+		{false, SubEl} ->
+		    Message = {body, fxml:get_tag_cdata(SubEl)},
 		    add_message_to_log(Nick, Message, Room, Opts, State);
-		{Subj, _} ->
-		    Message = {subject, xmpp:get_text(Subj)},
+		{SubEl, _} ->
+		    Message = {subject, fxml:get_tag_cdata(SubEl)},
 		    add_message_to_log(Nick, Message, Room, Opts, State)
 	    end;
 	true -> ok
@@ -210,18 +246,18 @@ build_filename_string(TimeStamp, OutDir, RoomJID,
     {Dir, Filename, Rel} = case DirType of
 			     subdirs ->
 				 SYear =
-				     (str:format("~4..0w",
+				     iolist_to_binary(io_lib:format("~4..0w",
 								    [Year])),
 				 SMonth =
-				     (str:format("~2..0w",
+				     iolist_to_binary(io_lib:format("~2..0w",
 								    [Month])),
-				 SDay = (str:format("~2..0w",
+				 SDay = iolist_to_binary(io_lib:format("~2..0w",
 								       [Day])),
 				 {fjoin([SYear, SMonth]), SDay,
 				  <<"../..">>};
 			     plain ->
 				 Date =
-				     (str:format("~4..0w-~2..0w-~2..0w",
+				     iolist_to_binary(io_lib:format("~4..0w-~2..0w-~2..0w",
 								    [Year,
 								     Month,
 								     Day])),
@@ -241,7 +277,7 @@ build_filename_string(TimeStamp, OutDir, RoomJID,
     {Fd, Fn, Fnrel}.
 
 get_room_name(RoomJID) ->
-    JID = jid:decode(RoomJID), JID#jid.user.
+    JID = jid:from_string(RoomJID), JID#jid.user.
 
 %% calculate day before
 get_timestamp_daydiff(TimeStamp, Daydiff) ->
@@ -500,7 +536,7 @@ make_dir_rec(Dir) ->
 %% {ok, F1}=file:open("valid-xhtml10.png", [read]).
 %% {ok, F1b}=file:read(F1, 1000000).
 %% c("../../ejabberd/src/jlib.erl").
-%% base64:encode(F1b).
+%% jlib:encode_base64(F1b).
 
 image_base64(<<"powered-by-erlang.png">>) ->
     <<"iVBORw0KGgoAAAANSUhEUgAAAGUAAAAfCAYAAAD+xQNoA"
@@ -676,7 +712,7 @@ create_image_files(Images_dir) ->
     lists:foreach(fun (Filename) ->
 			  Filename_full = fjoin([Images_dir, Filename]),
 			  {ok, F} = file:open(Filename_full, [write]),
-			  Image = base64:decode(image_base64(Filename)),
+			  Image = jlib:decode_base64(image_base64(Filename)),
 			  io:format(F, <<"~s">>, [Image]),
 			  file:close(F)
 		  end,
@@ -690,7 +726,7 @@ fw(F, S, FileFormat) when is_atom(FileFormat) ->
     fw(F, S, [], FileFormat).
 
 fw(F, S, O, FileFormat) ->
-    S1 = (str:format(binary_to_list(S) ++ "~n", O)),
+    S1 = list_to_binary(io_lib:format(binary_to_list(S) ++ "~n", O)),
     S2 = case FileFormat of
 	     html ->
 		 S1;
@@ -961,7 +997,7 @@ get_room_info(RoomJID, Opts) ->
 		      {value, {_, SA}} -> SA;
 		      false -> <<"">>
 		    end,
-    #room{jid = jid:encode(RoomJID), title = Title,
+    #room{jid = jid:to_string(RoomJID), title = Title,
 	  subject = Subject, subject_author = SubjectAuthor,
 	  config = Opts}.
 
@@ -996,7 +1032,7 @@ roomconfig_to_string(Options, Lang, FileFormat) ->
 					   max_users ->
 					       <<"<div class=\"rcot\">",
 						 OptText/binary, ": \"",
-						 (htmlize(integer_to_binary(T),
+						 (htmlize(jlib:integer_to_binary(T),
 							  FileFormat))/binary,
 						 "\"</div>">>;
 					   title ->
@@ -1014,7 +1050,7 @@ roomconfig_to_string(Options, Lang, FileFormat) ->
 					   allow_private_messages_from_visitors ->
 					       <<"<div class=\"rcot\">",
 						 OptText/binary, ": \"",
-						 (htmlize(?T(misc:atom_to_binary(T)),
+						 (htmlize(?T((jlib:atom_to_binary(T))),
 							  FileFormat))/binary,
 						 "\"</div>">>;
 					   _ -> <<"\"", T/binary, "\"">>
@@ -1122,24 +1158,26 @@ role_users_to_string(RoleS, Users) ->
     <<RoleS/binary, ": ", UsersString/binary>>.
 
 get_room_occupants(RoomJIDString) ->
-    RoomJID = jid:decode(RoomJIDString),
+    RoomJID = jid:from_string(RoomJIDString),
     RoomName = RoomJID#jid.luser,
     MucService = RoomJID#jid.lserver,
     StateData = get_room_state(RoomName, MucService),
     [{U#user.jid, U#user.nick, U#user.role}
      || {_, U} <- (?DICT):to_list(StateData#state.users)].
 
--spec get_room_state(binary(), binary()) -> mod_muc_room:state().
+-spec get_room_state(binary(), binary()) -> muc_room_state().
 
 get_room_state(RoomName, MucService) ->
-    case mod_muc:find_online_room(RoomName, MucService) of
-	{ok, RoomPid} ->
+    case mnesia:dirty_read(muc_online_room,
+			   {RoomName, MucService})
+	of
+      [R] ->
+	  RoomPid = R#muc_online_room.pid,
 	  get_room_state(RoomPid);
-	error ->
-	    #state{}
+      [] -> #state{}
     end.
 
--spec get_room_state(pid()) -> mod_muc_room:state().
+-spec get_room_state(pid()) -> muc_room_state().
 
 get_room_state(RoomPid) ->
     {ok, R} = gen_fsm:sync_send_all_state_event(RoomPid,
@@ -1147,7 +1185,7 @@ get_room_state(RoomPid) ->
     R.
 
 get_proc_name(Host) ->
-    gen_mod:get_module_proc(Host, ?MODULE).
+    gen_mod:get_module_proc(Host, ?PROCNAME).
 
 calc_hour_offset(TimeHere) ->
     TimeZero = calendar:universal_time(),
@@ -1163,14 +1201,18 @@ fjoin(FileList) ->
     list_to_binary(filename:join([binary_to_list(File) || File <- FileList])).
 
 has_no_permanent_store_hint(Packet) ->
-    xmpp:has_subtag(Packet, #hint{type = 'no-store'}) orelse
-    xmpp:has_subtag(Packet, #hint{type = 'no-storage'}) orelse
-    xmpp:has_subtag(Packet, #hint{type = 'no-permanent-store'}) orelse
-    xmpp:has_subtag(Packet, #hint{type = 'no-permanent-storage'}).
+    fxml:get_subtag_with_xmlns(Packet, <<"no-store">>, ?NS_HINTS)
+      =/= false orelse
+    fxml:get_subtag_with_xmlns(Packet, <<"no-storage">>, ?NS_HINTS)
+      =/= false orelse
+    fxml:get_subtag_with_xmlns(Packet, <<"no-permanent-store">>, ?NS_HINTS)
+      =/= false orelse
+    fxml:get_subtag_with_xmlns(Packet, <<"no-permanent-storage">>, ?NS_HINTS)
+      =/= false.
 
 mod_opt_type(access_log) ->
-    fun acl:access_rules_validator/1;
-mod_opt_type(cssfile) -> fun misc:try_read_file/1;
+    fun (A) when is_atom(A) -> A end;
+mod_opt_type(cssfile) -> fun iolist_to_binary/1;
 mod_opt_type(dirname) ->
     fun (room_jid) -> room_jid;
 	(room_name) -> room_name
@@ -1185,13 +1227,11 @@ mod_opt_type(file_format) ->
     end;
 mod_opt_type(file_permissions) ->
     fun (SubOpts) ->
-	    {proplists:get_value(mode, SubOpts, 644),
-	     proplists:get_value(group, SubOpts, 33)}
+	    F = fun ({mode, Mode}, {_M, G}) -> {Mode, G};
+		    ({group, Group}, {M, _G}) -> {M, Group}
+		end,
+	    lists:foldl(F, {644, 33}, SubOpts)
     end;
-mod_opt_type({file_permissions, mode}) ->
-    fun(I) when is_integer(I), I>=0 -> I end;
-mod_opt_type({file_permissions, group}) ->
-    fun(I) when is_integer(I), I>=0 -> I end;
 mod_opt_type(outdir) -> fun iolist_to_binary/1;
 mod_opt_type(spam_prevention) ->
     fun (B) when is_boolean(B) -> B end;
@@ -1205,5 +1245,8 @@ mod_opt_type(top_link) ->
     end;
 mod_opt_type(_) ->
     [access_log, cssfile, dirname, dirtype, file_format,
-     {file_permissions, mode}, {file_permissions, group},
-     outdir, spam_prevention, timezone, top_link].
+     file_permissions, outdir, spam_prevention, timezone,
+     top_link].
+
+opt_type(language) -> fun iolist_to_binary/1;
+opt_type(_) -> [language].

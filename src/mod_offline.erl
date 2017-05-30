@@ -5,7 +5,7 @@
 %%% Created :  5 Jan 2003 by Alexey Shchepin <alexey@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2016   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -25,6 +25,8 @@
 
 -module(mod_offline).
 
+-compile([{parse_transform, ejabberd_sql_pt}]).
+
 -author('alexey@process-one.net').
 
 -protocol({xep, 13, '1.2'}).
@@ -33,44 +35,46 @@
 -protocol({xep, 160, '1.0'}).
 -protocol({xep, 334, '0.2'}).
 
+-define(GEN_SERVER, p1_server).
+-behaviour(?GEN_SERVER).
+
 -behaviour(gen_mod).
 
 -export([start/2,
+	 start_link/2,
 	 stop/1,
-	 reload/3,
-	 store_packet/1,
-	 store_offline_msg/1,
-	 c2s_self_presence/1,
+	 store_packet/3,
+	 store_offline_msg/5,
+	 resend_offline_messages/2,
+	 pop_offline_messages/3,
 	 get_sm_features/5,
 	 get_sm_identity/5,
 	 get_sm_items/5,
 	 get_info/5,
-	 handle_offline_query/1,
+	 handle_offline_query/3,
 	 remove_expired_messages/1,
 	 remove_old_messages/2,
 	 remove_user/2,
-	 import_info/0,
-	 import_start/2,
-	 import/5,
+	 import/1,
+	 import/3,
 	 export/1,
 	 get_queue_length/2,
 	 count_offline_messages/2,
 	 get_offline_els/2,
-	 find_x_expire/2,
-	 c2s_handle_info/2,
-	 c2s_copy_session/2,
 	 webadmin_page/3,
 	 webadmin_user/4,
 	 webadmin_user_parse_query/5]).
 
--export([mod_opt_type/1, depends/2]).
+-export([init/1, handle_call/3, handle_cast/2,
+	 handle_info/2, terminate/2, code_change/3,
+	 mod_opt_type/1]).
 
 -deprecated({get_queue_length,2}).
 
 -include("ejabberd.hrl").
 -include("logger.hrl").
 
--include("xmpp.hrl").
+-include("jlib.hrl").
 
 -include("ejabberd_http.hrl").
 
@@ -78,41 +82,56 @@
 
 -include("mod_offline.hrl").
 
+-include("ejabberd_sql_pt.hrl").
+
+-define(PROCNAME, ejabberd_offline).
+
 -define(OFFLINE_TABLE_LOCK_THRESHOLD, 1000).
 
 %% default value for the maximum number of user messages
 -define(MAX_USER_MESSAGES, infinity).
 
--type c2s_state() :: ejabberd_c2s:state().
-
--callback init(binary(), gen_mod:opts()) -> any().
--callback import(#offline_msg{}) -> ok.
--callback store_message(#offline_msg{}) -> ok | {error, any()}.
--callback pop_messages(binary(), binary()) ->
-    {ok, [#offline_msg{}]} | {error, any()}.
--callback remove_expired_messages(binary()) -> {atomic, any()}.
--callback remove_old_messages(non_neg_integer(), binary()) -> {atomic, any()}.
--callback remove_user(binary(), binary()) -> any().
--callback read_message_headers(binary(), binary()) ->
-    [{non_neg_integer(), jid(), jid(), undefined | erlang:timestamp(), xmlel()}].
--callback read_message(binary(), binary(), non_neg_integer()) ->
-    {ok, #offline_msg{}} | error.
--callback remove_message(binary(), binary(), non_neg_integer()) -> ok | {error, any()}.
--callback read_all_messages(binary(), binary()) -> [#offline_msg{}].
--callback remove_all_messages(binary(), binary()) -> {atomic, any()}.
--callback count_messages(binary(), binary()) -> non_neg_integer().
-
-depends(_Host, _Opts) ->
-    [].
+start_link(Host, Opts) ->
+    Proc = gen_mod:get_module_proc(Host, ?PROCNAME),
+    ?GEN_SERVER:start_link({local, Proc}, ?MODULE,
+                           [Host, Opts], []).
 
 start(Host, Opts) ->
-    Mod = gen_mod:db_mod(Host, Opts, ?MODULE),
-    Mod:init(Host, Opts),
-    IQDisc = gen_mod:get_opt(iqdisc, Opts, gen_iq_handler:iqdisc(Host)),
+    Proc = gen_mod:get_module_proc(Host, ?PROCNAME),
+    ChildSpec = {Proc, {?MODULE, start_link, [Host, Opts]},
+		 transient, 1000, worker, [?MODULE]},
+    supervisor:start_child(ejabberd_sup, ChildSpec).
+
+stop(Host) ->
+    Proc = gen_mod:get_module_proc(Host, ?PROCNAME),
+    catch ?GEN_SERVER:call(Proc, stop),
+    supervisor:terminate_child(ejabberd_sup, Proc),
+    supervisor:delete_child(ejabberd_sup, Proc),
+    ok.
+
+
+%%====================================================================
+%% gen_server callbacks
+%%====================================================================
+
+init([Host, Opts]) ->
+    case gen_mod:db_type(Host, Opts) of
+      mnesia ->
+	  mnesia:create_table(offline_msg,
+			      [{disc_only_copies, [node()]}, {type, bag},
+			       {attributes, record_info(fields, offline_msg)}]),
+	  update_table();
+      _ -> ok
+    end,
+    IQDisc = gen_mod:get_opt(iqdisc, Opts, fun gen_iq_handler:check_type/1,
+			     no_queue),
     ejabberd_hooks:add(offline_message_hook, Host, ?MODULE,
 		       store_packet, 50),
-    ejabberd_hooks:add(c2s_self_presence, Host, ?MODULE, c2s_self_presence, 50),
+    ejabberd_hooks:add(resend_offline_messages_hook, Host,
+		       ?MODULE, pop_offline_messages, 50),
     ejabberd_hooks:add(remove_user, Host,
+		       ?MODULE, remove_user, 50),
+    ejabberd_hooks:add(anonymous_purge_hook, Host,
 		       ?MODULE, remove_user, 50),
     ejabberd_hooks:add(disco_sm_features, Host,
 		       ?MODULE, get_sm_features, 50),
@@ -123,8 +142,6 @@ start(Host, Opts) ->
     ejabberd_hooks:add(disco_sm_items, Host,
 		       ?MODULE, get_sm_items, 50),
     ejabberd_hooks:add(disco_info, Host, ?MODULE, get_info, 50),
-    ejabberd_hooks:add(c2s_handle_info, Host, ?MODULE, c2s_handle_info, 50),
-    ejabberd_hooks:add(c2s_copy_session, Host, ?MODULE, c2s_copy_session, 50),
     ejabberd_hooks:add(webadmin_page_host, Host,
 		       ?MODULE, webadmin_page, 50),
     ejabberd_hooks:add(webadmin_user, Host,
@@ -132,67 +149,149 @@ start(Host, Opts) ->
     ejabberd_hooks:add(webadmin_user_parse_query, Host,
 		       ?MODULE, webadmin_user_parse_query, 50),
     gen_iq_handler:add_iq_handler(ejabberd_sm, Host, ?NS_FLEX_OFFLINE,
-				  ?MODULE, handle_offline_query, IQDisc).
+				  ?MODULE, handle_offline_query, IQDisc),
+    AccessMaxOfflineMsgs =
+	gen_mod:get_opt(access_max_user_messages, Opts,
+			fun(A) when is_atom(A) -> A end,
+			max_user_offline_messages),
+    {ok,
+     #state{host = Host,
+            access_max_offline_messages = AccessMaxOfflineMsgs}}.
 
-stop(Host) ->
+
+handle_call(stop, _From, State) ->
+    {stop, normal, ok, State}.
+
+
+handle_cast(_Msg, State) -> {noreply, State}.
+
+
+handle_info(#offline_msg{us = UserServer} = Msg, State) ->
+    #state{host = Host,
+           access_max_offline_messages = AccessMaxOfflineMsgs} = State,
+    DBType = gen_mod:db_type(Host, ?MODULE),
+    Msgs = receive_all(UserServer, [Msg], DBType),
+    Len = length(Msgs),
+    MaxOfflineMsgs = get_max_user_messages(AccessMaxOfflineMsgs,
+                                           UserServer, Host),
+    store_offline_msg(Host, UserServer, Msgs, Len, MaxOfflineMsgs, DBType),
+    {noreply, State};
+
+handle_info(_Info, State) ->
+    ?ERROR_MSG("got unexpected info: ~p", [_Info]),
+    {noreply, State}.
+
+
+terminate(_Reason, State) ->
+    Host = State#state.host,
     ejabberd_hooks:delete(offline_message_hook, Host,
 			  ?MODULE, store_packet, 50),
-    ejabberd_hooks:delete(c2s_self_presence, Host, ?MODULE, c2s_self_presence, 50),
+    ejabberd_hooks:delete(resend_offline_messages_hook,
+			  Host, ?MODULE, pop_offline_messages, 50),
     ejabberd_hooks:delete(remove_user, Host, ?MODULE,
 			  remove_user, 50),
+    ejabberd_hooks:delete(anonymous_purge_hook, Host,
+			  ?MODULE, remove_user, 50),
     ejabberd_hooks:delete(disco_sm_features, Host, ?MODULE, get_sm_features, 50),
     ejabberd_hooks:delete(disco_local_features, Host, ?MODULE, get_sm_features, 50),
     ejabberd_hooks:delete(disco_sm_identity, Host, ?MODULE, get_sm_identity, 50),
     ejabberd_hooks:delete(disco_sm_items, Host, ?MODULE, get_sm_items, 50),
     ejabberd_hooks:delete(disco_info, Host, ?MODULE, get_info, 50),
-    ejabberd_hooks:delete(c2s_handle_info, Host, ?MODULE, c2s_handle_info, 50),
-    ejabberd_hooks:delete(c2s_copy_session, Host, ?MODULE, c2s_copy_session, 50),
     ejabberd_hooks:delete(webadmin_page_host, Host,
 			  ?MODULE, webadmin_page, 50),
     ejabberd_hooks:delete(webadmin_user, Host,
 			  ?MODULE, webadmin_user, 50),
     ejabberd_hooks:delete(webadmin_user_parse_query, Host,
 			  ?MODULE, webadmin_user_parse_query, 50),
-    gen_iq_handler:remove_iq_handler(ejabberd_sm, Host, ?NS_FLEX_OFFLINE).
+    gen_iq_handler:remove_iq_handler(ejabberd_sm, Host, ?NS_FLEX_OFFLINE),
+    ok.
 
-reload(Host, NewOpts, OldOpts) ->
-    NewMod = gen_mod:db_mod(Host, NewOpts, ?MODULE),
-    OldMod = gen_mod:db_mod(Host, OldOpts, ?MODULE),
-    if NewMod /= OldMod ->
-	    NewMod:init(Host, NewOpts);
+
+code_change(_OldVsn, State, _Extra) -> {ok, State}.
+
+store_offline_msg(Host, US, Msgs, Len, MaxOfflineMsgs) ->
+    DBType = gen_mod:db_type(Host, ?MODULE),
+    store_offline_msg(Host, US, Msgs, Len, MaxOfflineMsgs, DBType).
+
+store_offline_msg(_Host, US, Msgs, Len, MaxOfflineMsgs,
+		  mnesia) ->
+    F = fun () ->
+		Count = if MaxOfflineMsgs =/= infinity ->
+			       Len + count_mnesia_records(US);
+			   true -> 0
+			end,
+		if Count > MaxOfflineMsgs -> discard_warn_sender(Msgs);
+		   true ->
+		       if Len >= (?OFFLINE_TABLE_LOCK_THRESHOLD) ->
+			      mnesia:write_lock_table(offline_msg);
+			  true -> ok
+		       end,
+		       lists:foreach(fun (M) -> mnesia:write(M) end, Msgs)
+		end
+	end,
+    mnesia:transaction(F);
+store_offline_msg(Host, {User, _Server}, Msgs, Len, MaxOfflineMsgs, odbc) ->
+    Count = if MaxOfflineMsgs =/= infinity ->
+		   Len + count_offline_messages(User, Host);
+	       true -> 0
+	    end,
+    if Count > MaxOfflineMsgs -> discard_warn_sender(Msgs);
        true ->
-	    ok
-    end,
-    case gen_mod:is_equal_opt(iqdisc, NewOpts, OldOpts, gen_iq_handler:iqdisc(Host)) of
-	{false, IQDisc, _} ->
-	    gen_iq_handler:add_iq_handler(ejabberd_sm, Host, ?NS_FLEX_OFFLINE,
-					  ?MODULE, handle_offline_query, IQDisc);
-	true ->
-	    ok
+	   Query = lists:map(fun (M) ->
+				     Username =
+					 ejabberd_odbc:escape((M#offline_msg.to)#jid.luser),
+				     From = M#offline_msg.from,
+				     To = M#offline_msg.to,
+				     Packet =
+					 jlib:replace_from_to(From, To,
+							      M#offline_msg.packet),
+				     NewPacket =
+					 jlib:add_delay_info(Packet, Host,
+							     M#offline_msg.timestamp,
+							     <<"Offline Storage">>),
+				     XML =
+					 ejabberd_odbc:escape(fxml:element_to_binary(NewPacket)),
+				     odbc_queries:add_spool_sql(Username, XML)
+			     end,
+			     Msgs),
+	   odbc_queries:add_spool(Host, Query)
+    end;
+store_offline_msg(Host, {User, _}, Msgs, Len, MaxOfflineMsgs,
+		  riak) ->
+    Count = if MaxOfflineMsgs =/= infinity ->
+                    Len + count_offline_messages(User, Host);
+               true -> 0
+            end,
+    if
+        Count > MaxOfflineMsgs ->
+            discard_warn_sender(Msgs);
+        true ->
+            lists:foreach(
+              fun(#offline_msg{us = US,
+                               timestamp = TS} = M) ->
+                      ejabberd_riak:put(M, offline_msg_schema(),
+					[{i, TS}, {'2i', [{<<"us">>, US}]}])
+              end, Msgs)
     end.
 
--spec store_offline_msg(#offline_msg{}) -> ok | {error, full | any()}.
-store_offline_msg(#offline_msg{us = {User, Server}} = Msg) ->
-    Mod = gen_mod:db_mod(Server, ?MODULE),
-    case get_max_user_messages(User, Server) of
-	infinity ->
-	    Mod:store_message(Msg);
-	Limit ->
-	    Num = count_offline_messages(User, Server),
-	    if Num < Limit ->
-		    Mod:store_message(Msg);
-	       true ->
-		    {error, full}
-	    end
-    end.
-
-get_max_user_messages(User, Server) ->
-    Access = gen_mod:get_module_opt(Server, ?MODULE, access_max_user_messages,
-				    max_user_offline_messages),
-    case acl:match_rule(Server, Access, jid:make(User, Server)) of
+get_max_user_messages(AccessRule, {User, Server}, Host) ->
+    case acl:match_rule(
+	   Host, AccessRule, jid:make(User, Server, <<"">>)) of
 	Max when is_integer(Max) -> Max;
 	infinity -> infinity;
 	_ -> ?MAX_USER_MESSAGES
+    end.
+
+receive_all(US, Msgs, DBType) ->
+    receive
+      #offline_msg{us = US} = Msg ->
+	  receive_all(US, [Msg | Msgs], DBType)
+      after 0 ->
+		case DBType of
+		  mnesia -> Msgs;
+		  odbc -> lists:reverse(Msgs);
+		  riak -> Msgs
+		end
     end.
 
 get_sm_features(Acc, _From, _To, <<"">>, _Lang) ->
@@ -213,228 +312,240 @@ get_sm_features(_Acc, #jid{luser = U, lserver = S}, #jid{luser = U, lserver = S}
 get_sm_features(Acc, _From, _To, _Node, _Lang) ->
     Acc.
 
-get_sm_identity(Acc, #jid{luser = U, lserver = S}, #jid{luser = U, lserver = S},
+get_sm_identity(_Acc, #jid{luser = U, lserver = S}, #jid{luser = U, lserver = S},
 		?NS_FLEX_OFFLINE, _Lang) ->
-    [#identity{category = <<"automation">>,
-	       type = <<"message-list">>}|Acc];
+    Identity = #xmlel{name = <<"identity">>,
+		      attrs = [{<<"category">>, <<"automation">>},
+			       {<<"type">>, <<"message-list">>}]},
+    [Identity];
 get_sm_identity(Acc, _From, _To, _Node, _Lang) ->
     Acc.
 
-get_sm_items(_Acc, #jid{luser = U, lserver = S} = JID,
+get_sm_items(_Acc, #jid{luser = U, lserver = S, lresource = R} = JID,
 	     #jid{luser = U, lserver = S},
 	     ?NS_FLEX_OFFLINE, _Lang) ->
-    ejabberd_sm:route(JID, {resend_offline, false}),
-	    Mod = gen_mod:db_mod(S, ?MODULE),
-	    Hdrs = Mod:read_message_headers(U, S),
-	    BareJID = jid:remove_resource(JID),
+    case ejabberd_sm:get_session_pid(U, S, R) of
+	Pid when is_pid(Pid) ->
+	    Hdrs = read_message_headers(U, S),
+	    BareJID = jid:to_string(jid:remove_resource(JID)),
+	    Pid ! dont_ask_offline,
 	    {result, lists:map(
-		       fun({Seq, From, _To, _TS, _El}) ->
-			       Node = integer_to_binary(Seq),
-			       #disco_item{jid = BareJID,
-					   node = Node,
-					   name = jid:encode(From)}
+		       fun({Node, From, _OfflineMsg}) ->
+			       #xmlel{name = <<"item">>,
+				      attrs = [{<<"jid">>, BareJID},
+					       {<<"node">>, Node},
+					       {<<"name">>, From}]}
 		       end, Hdrs)};
+	none ->
+	    {result, []}
+    end;
 get_sm_items(Acc, _From, _To, _Node, _Lang) ->
     Acc.
 
--spec get_info([xdata()], binary(), module(), binary(), binary()) -> [xdata()];
-	      ([xdata()], jid(), jid(), binary(), binary()) -> [xdata()].
-get_info(_Acc, #jid{luser = U, lserver = S} = JID,
-	 #jid{luser = U, lserver = S}, ?NS_FLEX_OFFLINE, Lang) ->
-    ejabberd_sm:route(JID, {resend_offline, false}),
-    [#xdata{type = result,
-	    fields = flex_offline:encode(
-		       [{number_of_messages, count_offline_messages(U, S)}],
-		       Lang)}];
+get_info(_Acc, #jid{luser = U, lserver = S, lresource = R},
+	 #jid{luser = U, lserver = S}, ?NS_FLEX_OFFLINE, _Lang) ->
+    N = jlib:integer_to_binary(count_offline_messages(U, S)),
+    case ejabberd_sm:get_session_pid(U, S, R) of
+	Pid when is_pid(Pid) ->
+	    Pid ! dont_ask_offline;
+	none ->
+	    ok
+    end,
+    [#xmlel{name = <<"x">>,
+	    attrs = [{<<"xmlns">>, ?NS_XDATA},
+		     {<<"type">>, <<"result">>}],
+	    children = [#xmlel{name = <<"field">>,
+			       attrs = [{<<"var">>, <<"FORM_TYPE">>},
+					{<<"type">>, <<"hidden">>}],
+			       children = [#xmlel{name = <<"value">>,
+						  children = [{xmlcdata,
+							       ?NS_FLEX_OFFLINE}]}]},
+			#xmlel{name = <<"field">>,
+			       attrs = [{<<"var">>, <<"number_of_messages">>}],
+			       children = [#xmlel{name = <<"value">>,
+						  children = [{xmlcdata, N}]}]}]}];
 get_info(Acc, _From, _To, _Node, _Lang) ->
     Acc.
 
--spec c2s_handle_info(c2s_state(), term()) -> c2s_state().
-c2s_handle_info(State, {resend_offline, Flag}) ->
-    {stop, State#{resend_offline => Flag}};
-c2s_handle_info(State, _) ->
-    State.
-
--spec c2s_copy_session(c2s_state(), c2s_state()) -> c2s_state().
-c2s_copy_session(State, #{resend_offline := Flag}) ->
-    State#{resend_offline => Flag};
-c2s_copy_session(State, _) ->
-    State.
-
--spec handle_offline_query(iq()) -> iq().
-handle_offline_query(#iq{from = #jid{luser = U1, lserver = S1},
-			 to = #jid{luser = U2, lserver = S2},
-			 lang = Lang,
-			 sub_els = [#offline{}]} = IQ)
-  when {U1, S1} /= {U2, S2} ->
-    Txt = <<"Query to another users is forbidden">>,
-    xmpp:make_error(IQ, xmpp:err_forbidden(Txt, Lang));
-handle_offline_query(#iq{from = #jid{luser = U, lserver = S} = From,
-			 to = #jid{luser = U, lserver = S} = _To,
-			 type = Type, lang = Lang,
-			 sub_els = [#offline{} = Offline]} = IQ) ->
-    case {Type, Offline} of
-	{get, #offline{fetch = true, items = [], purge = false}} ->
-	    %% TODO: report database errors
-	    handle_offline_fetch(From),
-	    xmpp:make_iq_result(IQ);
-	{get, #offline{fetch = false, items = [_|_] = Items, purge = false}} ->
-	    case handle_offline_items_view(From, Items) of
-		true -> xmpp:make_iq_result(IQ);
-		false -> xmpp:make_error(IQ, xmpp:err_item_not_found())
+handle_offline_query(#jid{luser = U, lserver = S} = From,
+		     #jid{luser = U, lserver = S} = _To,
+		     #iq{type = Type, sub_el = SubEl} = IQ) ->
+    case Type of
+	get ->
+	    case fxml:get_subtag(SubEl, <<"fetch">>) of
+		#xmlel{} ->
+		    handle_offline_fetch(From);
+		false ->
+		    handle_offline_items_view(From, SubEl)
 	    end;
-	{set, #offline{fetch = false, items = [], purge = true}} ->
-	    case delete_all_msgs(U, S) of
-		{atomic, ok} ->
-		    xmpp:make_iq_result(IQ);
-		_Err ->
-		    Txt = <<"Database failure">>,
-		    xmpp:make_error(IQ, xmpp:err_internal_server_error(Txt, Lang))
-	    end;
-	{set, #offline{fetch = false, items = [_|_] = Items, purge = false}} ->
-	    case handle_offline_items_remove(From, Items) of
-		true -> xmpp:make_iq_result(IQ);
-		false -> xmpp:make_error(IQ, xmpp:err_item_not_found())
-	    end;
-	_ ->
-	    xmpp:make_error(IQ, xmpp:err_bad_request())
-    end;
-handle_offline_query(#iq{lang = Lang} = IQ) ->
-    Txt = <<"No module is handling this query">>,
-    xmpp:make_error(IQ, xmpp:err_service_unavailable(Txt, Lang)).
+	set ->
+	    case fxml:get_subtag(SubEl, <<"purge">>) of
+		#xmlel{} ->
+		    delete_all_msgs(U, S);
+		false ->
+		    handle_offline_items_remove(From, SubEl)
+	    end
+    end,
+    IQ#iq{type = result, sub_el = []};
+handle_offline_query(_From, _To, #iq{sub_el = SubEl} = IQ) ->
+    IQ#iq{type = error, sub_el = [SubEl, ?ERR_FORBIDDEN]}.
 
--spec handle_offline_items_view(jid(), [offline_item()]) -> boolean().
-handle_offline_items_view(JID, Items) ->
+handle_offline_items_view(JID, #xmlel{children = Items}) ->
     {U, S, R} = jid:tolower(JID),
-    lists:foldl(
-      fun(#offline_item{node = Node, action = view}, Acc) ->
+    lists:foreach(
+      fun(Node) ->
 	      case fetch_msg_by_node(JID, Node) of
 		  {ok, OfflineMsg} ->
 		      case offline_msg_to_route(S, OfflineMsg) of
-			  {route, El} ->
+			  {route, From, To, El} ->
 			      NewEl = set_offline_tag(El, Node),
 			      case ejabberd_sm:get_session_pid(U, S, R) of
 				  Pid when is_pid(Pid) ->
-				      Pid ! {route, NewEl};
+				      Pid ! {route, From, To, NewEl};
 				  none ->
 				      ok
-			      end,
-			      Acc or true;
+			      end;
 			  error ->
-			      Acc or false
+			      ok
 		      end;
 		  error ->
-		      Acc or false
+		      ok
 	      end
-      end, false, Items).
+      end, get_nodes_from_items(Items, <<"view">>)).
 
--spec handle_offline_items_remove(jid(), [offline_item()]) -> boolean().
-handle_offline_items_remove(JID, Items) ->
-    lists:foldl(
-      fun(#offline_item{node = Node, action = remove}, Acc) ->
-	      Acc or remove_msg_by_node(JID, Node)
-      end, false, Items).
+handle_offline_items_remove(JID, #xmlel{children = Items}) ->
+    lists:foreach(
+      fun(Node) ->
+	      remove_msg_by_node(JID, Node)
+      end, get_nodes_from_items(Items, <<"remove">>)).
 
--spec set_offline_tag(message(), binary()) -> message().
-set_offline_tag(Msg, Node) ->
-    xmpp:set_subtag(Msg, #offline{items = [#offline_item{node = Node}]}).
+get_nodes_from_items(Items, Action) ->
+    lists:flatmap(
+      fun(#xmlel{name = <<"item">>, attrs = Attrs}) ->
+	      case fxml:get_attr_s(<<"action">>, Attrs) of
+		  Action ->
+		      case fxml:get_attr_s(<<"node">>, Attrs) of
+			  <<"">> ->
+			      [];
+			  TS ->
+			      [TS]
+		      end;
+		  _ ->
+		      []
+	      end;
+	 (_) ->
+	      []
+      end, Items).
 
--spec handle_offline_fetch(jid()) -> ok.
-handle_offline_fetch(#jid{luser = U, lserver = S} = JID) ->
-    ejabberd_sm:route(JID, {resend_offline, false}),
+set_offline_tag(#xmlel{children = Els} = El, Node) ->
+    OfflineEl = #xmlel{name = <<"offline">>,
+		       attrs = [{<<"xmlns">>, ?NS_FLEX_OFFLINE}],
+		       children = [#xmlel{name = <<"item">>,
+					  attrs = [{<<"node">>, Node}]}]},
+    El#xmlel{children = [OfflineEl|Els]}.
+
+handle_offline_fetch(#jid{luser = U, lserver = S, lresource = R}) ->
+    case ejabberd_sm:get_session_pid(U, S, R) of
+	none ->
+	    ok;
+	Pid when is_pid(Pid) ->
+	    Pid ! dont_ask_offline,
 	    lists:foreach(
-	      fun({Node, El}) ->
-	      El1 = set_offline_tag(El, Node),
-	      ejabberd_router:route(El1)
-      end, read_messages(U, S)).
-
--spec fetch_msg_by_node(jid(), binary()) -> error | {ok, #offline_msg{}}.
-fetch_msg_by_node(To, Seq) ->
-    case catch binary_to_integer(Seq) of
-	I when is_integer(I), I >= 0 ->
-	    LUser = To#jid.luser,
-	    LServer = To#jid.lserver,
-	    Mod = gen_mod:db_mod(LServer, ?MODULE),
-	    Mod:read_message(LUser, LServer, I);
-	_ ->
-	    error
+	      fun({Node, _, Msg}) ->
+		      case offline_msg_to_route(S, Msg) of
+			  {route, From, To, El} ->
+			      NewEl = set_offline_tag(El, Node),
+			      Pid ! {route, From, To, NewEl};
+			  error ->
+			      ok
+		      end
+	      end, read_message_headers(U, S))
     end.
 
--spec remove_msg_by_node(jid(), binary()) -> boolean().
-remove_msg_by_node(To, Seq) ->
-    case catch binary_to_integer(Seq) of
-	I when is_integer(I), I>= 0 ->
-	    LUser = To#jid.luser,
-	    LServer = To#jid.lserver,
-	    Mod = gen_mod:db_mod(LServer, ?MODULE),
-	    Mod:remove_message(LUser, LServer, I),
-	    true;
-	_ ->
-	    false
-    end.
-
--spec need_to_store(binary(), message()) -> boolean().
-need_to_store(_LServer, #message{type = error}) -> false;
-need_to_store(LServer, #message{type = Type} = Packet) ->
-    case xmpp:has_subtag(Packet, #offline{}) of
-	false ->
-	    case check_store_hint(Packet) of
-		store ->
-		    true;
-		no_store ->
-		    false;
-		none when Type == headline; Type == groupchat ->
-		    false;
-		none ->
-		    case gen_mod:get_module_opt(
-			   LServer, ?MODULE, store_empty_body,
-			   unless_chat_state) of
-			true ->
-			    true;
-			false ->
-			    Packet#message.body /= [];
-			unless_chat_state ->
-			    not xmpp_util:is_standalone_chat_state(Packet)
+fetch_msg_by_node(To, <<Seq:20/binary, "+", From_s/binary>>) ->
+    case jid:from_string(From_s) of
+	From = #jid{} ->
+	    case gen_mod:db_type(To#jid.lserver, ?MODULE) of
+		odbc ->
+		    read_message(From, To, Seq, odbc);
+		DBType ->
+		    case binary_to_timestamp(Seq) of
+			undefined -> ok;
+			TS -> read_message(From, To, TS, DBType)
 		    end
 	    end;
-	true ->
+	error ->
+	    ok
+    end.
+
+remove_msg_by_node(To, <<Seq:20/binary, "+", From_s/binary>>) ->
+    case jid:from_string(From_s) of
+	From = #jid{} ->
+	    case gen_mod:db_type(To#jid.lserver, ?MODULE) of
+		odbc ->
+		    remove_message(From, To, Seq, odbc);
+		DBType ->
+		    case binary_to_timestamp(Seq) of
+			undefined -> ok;
+			TS -> remove_message(From, To, TS, DBType)
+		    end
+	    end;
+	error ->
+	    ok
+    end.
+
+need_to_store(LServer, Packet) ->
+    Type = fxml:get_tag_attr_s(<<"type">>, Packet),
+    if (Type /= <<"error">>) and (Type /= <<"groupchat">>)
+       and (Type /= <<"headline">>) ->
+	    case has_offline_tag(Packet) of
+		false ->
+		    case check_store_hint(Packet) of
+			store ->
+			    true;
+			no_store ->
+			    false;
+			none ->
+			    case gen_mod:get_module_opt(
+				   LServer, ?MODULE, store_empty_body,
+				   fun(V) when is_boolean(V) -> V;
+				      (unless_chat_state) -> unless_chat_state
+				   end,
+				   unless_chat_state) of
+				false ->
+				    fxml:get_subtag(Packet, <<"body">>) /= false;
+				unless_chat_state ->
+				    not jlib:is_standalone_chat_state(Packet);
+				true ->
+				    true
+			    end
+		    end;
+		true ->
+		    false
+	    end;
+       true ->
 	    false
     end.
 
--spec store_packet({any(), message()}) -> {any(), message()}.
-store_packet({_Action, #message{from = From, to = To} = Packet} = Acc) ->
+store_packet(From, To, Packet) ->
     case need_to_store(To#jid.lserver, Packet) of
 	true ->
-	    case check_event(Packet) of
+	    case check_event(From, To, Packet) of
 		true ->
 		    #jid{luser = LUser, lserver = LServer} = To,
-		    case ejabberd_hooks:run_fold(store_offline_message, LServer,
-						 Packet, []) of
-			drop ->
-			    Acc;
-			NewPacket ->
-			    TimeStamp = p1_time_compat:timestamp(),
-			    Expire = find_x_expire(TimeStamp, NewPacket),
-			    OffMsg = #offline_msg{us = {LUser, LServer},
-						  timestamp = TimeStamp,
-						  expire = Expire,
-						  from = From,
-						  to = To,
-						  packet = NewPacket},
-			    case store_offline_msg(OffMsg) of
-				ok ->
-				    {offlined, NewPacket};
-				{error, Reason} ->
-				    discard_warn_sender(Packet, Reason),
-				    stop
-			    end
-		    end;
-		_ -> Acc
+		    TimeStamp = p1_time_compat:timestamp(),
+		    #xmlel{children = Els} = Packet,
+		    Expire = find_x_expire(TimeStamp, Els),
+		    gen_mod:get_module_proc(To#jid.lserver, ?PROCNAME) !
+		      #offline_msg{us = {LUser, LServer},
+				   timestamp = TimeStamp, expire = Expire,
+				   from = From, to = To, packet = Packet},
+		    stop;
+		_ -> ok
 	    end;
-	false -> Acc
+	false -> ok
     end.
 
--spec check_store_hint(message()) -> store | no_store | none.
 check_store_hint(Packet) ->
     case has_store_hint(Packet) of
 	true ->
@@ -448,141 +559,317 @@ check_store_hint(Packet) ->
 	    end
     end.
 
--spec has_store_hint(message()) -> boolean().
 has_store_hint(Packet) ->
-    xmpp:has_subtag(Packet, #hint{type = 'store'}).
+    fxml:get_subtag_with_xmlns(Packet, <<"store">>, ?NS_HINTS) =/= false.
 
--spec has_no_store_hint(message()) -> boolean().
 has_no_store_hint(Packet) ->
-    xmpp:has_subtag(Packet, #hint{type = 'no-store'})
-	orelse
-	xmpp:has_subtag(Packet, #hint{type = 'no-storage'}).
+    fxml:get_subtag_with_xmlns(Packet, <<"no-store">>, ?NS_HINTS) =/= false
+      orelse
+      fxml:get_subtag_with_xmlns(Packet, <<"no-storage">>, ?NS_HINTS) =/= false.
+
+has_offline_tag(Packet) ->
+    fxml:get_subtag_with_xmlns(Packet, <<"offline">>, ?NS_FLEX_OFFLINE) =/= false.
 
 %% Check if the packet has any content about XEP-0022
--spec check_event(message()) -> boolean().
-check_event(#message{from = From, to = To, id = ID, type = Type} = Msg) ->
-    case xmpp:get_subtag(Msg, #xevent{}) of
-	false ->
-	    true;
-	#xevent{id = undefined, offline = false} ->
-	    true;
-	#xevent{id = undefined, offline = true} ->
-	    NewMsg = #message{from = To, to = From, id = ID, type = Type,
-			      sub_els = [#xevent{id = ID, offline = true}]},
-	    ejabberd_router:route(NewMsg),
-	    true;
+check_event(From, To, Packet) ->
+    #xmlel{name = Name, attrs = Attrs, children = Els} =
+	Packet,
+    case find_x_event(Els) of
+      false -> true;
+      El ->
+	  case fxml:get_subtag(El, <<"id">>) of
+	    false ->
+		case fxml:get_subtag(El, <<"offline">>) of
+		  false -> true;
+		  _ ->
+		      ID = case fxml:get_tag_attr_s(<<"id">>, Packet) of
+			     <<"">> ->
+				 #xmlel{name = <<"id">>, attrs = [],
+					children = []};
+			     S ->
+				 #xmlel{name = <<"id">>, attrs = [],
+					children = [{xmlcdata, S}]}
+			   end,
+		      ejabberd_router:route(To, From,
+					    #xmlel{name = Name, attrs = Attrs,
+						   children =
+						       [#xmlel{name = <<"x">>,
+							       attrs =
+								   [{<<"xmlns">>,
+								     ?NS_EVENT}],
+							       children =
+								   [ID,
+								    #xmlel{name
+									       =
+									       <<"offline">>,
+									   attrs
+									       =
+									       [],
+									   children
+									       =
+									       []}]}]}),
+		      true
+		end;
+	    _ -> false
+	  end
+    end.
+
+%% Check if the packet has subelements about XEP-0022
+find_x_event([]) -> false;
+find_x_event([{xmlcdata, _} | Els]) ->
+    find_x_event(Els);
+find_x_event([El | Els]) ->
+    case fxml:get_tag_attr_s(<<"xmlns">>, El) of
+      ?NS_EVENT -> El;
+      _ -> find_x_event(Els)
+    end.
+
+find_x_expire(_, []) -> never;
+find_x_expire(TimeStamp, [{xmlcdata, _} | Els]) ->
+    find_x_expire(TimeStamp, Els);
+find_x_expire(TimeStamp, [El | Els]) ->
+    case fxml:get_tag_attr_s(<<"xmlns">>, El) of
+      ?NS_EXPIRE ->
+	  Val = fxml:get_tag_attr_s(<<"seconds">>, El),
+	  case catch jlib:binary_to_integer(Val) of
+	    {'EXIT', _} -> never;
+	    Int when Int > 0 ->
+		{MegaSecs, Secs, MicroSecs} = TimeStamp,
+		S = MegaSecs * 1000000 + Secs + Int,
+		MegaSecs1 = S div 1000000,
+		Secs1 = S rem 1000000,
+		{MegaSecs1, Secs1, MicroSecs};
+	    _ -> never
+	  end;
+      _ -> find_x_expire(TimeStamp, Els)
+    end.
+
+resend_offline_messages(User, Server) ->
+    LUser = jid:nodeprep(User),
+    LServer = jid:nameprep(Server),
+    US = {LUser, LServer},
+    F = fun () ->
+		Rs = mnesia:wread({offline_msg, US}),
+		mnesia:delete({offline_msg, US}),
+		Rs
+	end,
+    case mnesia:transaction(F) of
+      {atomic, Rs} ->
+	  lists:foreach(fun (R) ->
+				ejabberd_sm !
+				  {route, R#offline_msg.from, R#offline_msg.to,
+				   jlib:add_delay_info(R#offline_msg.packet,
+						       LServer,
+						       R#offline_msg.timestamp,
+						       <<"Offline Storage">>)}
+			end,
+			lists:keysort(#offline_msg.timestamp, Rs));
+      _ -> ok
+    end.
+
+pop_offline_messages(Ls, User, Server) ->
+    LUser = jid:nodeprep(User),
+    LServer = jid:nameprep(Server),
+    pop_offline_messages(Ls, LUser, LServer,
+			 gen_mod:db_type(LServer, ?MODULE)).
+
+pop_offline_messages(Ls, LUser, LServer, mnesia) ->
+    US = {LUser, LServer},
+    F = fun () ->
+		Rs = mnesia:wread({offline_msg, US}),
+		mnesia:delete({offline_msg, US}),
+		Rs
+	end,
+    case mnesia:transaction(F) of
+      {atomic, Rs} ->
+	  TS = p1_time_compat:timestamp(),
+	  Ls ++
+	    lists:map(fun (R) ->
+			      offline_msg_to_route(LServer, R)
+		      end,
+		      lists:filter(fun (R) ->
+					   case R#offline_msg.expire of
+					     never -> true;
+					     TimeStamp -> TS < TimeStamp
+					   end
+				   end,
+				   lists:keysort(#offline_msg.timestamp, Rs)));
+      _ -> Ls
+    end;
+pop_offline_messages(Ls, LUser, LServer, odbc) ->
+    case odbc_queries:get_and_del_spool_msg_t(LServer, LUser) of
+      {atomic, {selected, Rs}} ->
+	  Ls ++
+	    lists:flatmap(fun ({_, XML}) ->
+				  case fxml_stream:parse_element(XML) of
+				    {error, _Reason} ->
+                                          [];
+				    El ->
+                                          case offline_msg_to_route(LServer, El) of
+                                              error ->
+                                                  [];
+                                              RouteMsg ->
+                                                  [RouteMsg]
+                                          end
+				  end
+			  end,
+			  Rs);
+      _ -> Ls
+    end;
+pop_offline_messages(Ls, LUser, LServer, riak) ->
+    case ejabberd_riak:get_by_index(offline_msg, offline_msg_schema(),
+                                    <<"us">>, {LUser, LServer}) of
+        {ok, Rs} ->
+            try
+                lists:foreach(
+                  fun(#offline_msg{timestamp = T}) ->
+                          ok = ejabberd_riak:delete(offline_msg, T)
+                  end, Rs),
+                TS = p1_time_compat:timestamp(),
+                Ls ++ lists:map(
+                        fun (R) ->
+                                offline_msg_to_route(LServer, R)
+                        end,
+                        lists:filter(
+                          fun(R) ->
+                                  case R#offline_msg.expire of
+                                      never -> true;
+                                      TimeStamp -> TS < TimeStamp
+                                  end
+                          end,
+                          lists:keysort(#offline_msg.timestamp, Rs)))
+            catch _:{badmatch, _} ->
+                    Ls
+            end;
 	_ ->
-	    false
+	    Ls
     end.
-
--spec find_x_expire(erlang:timestamp(), message()) -> erlang:timestamp() | never.
-find_x_expire(TimeStamp, Msg) ->
-    case xmpp:get_subtag(Msg, #expire{seconds = 0}) of
-	#expire{seconds = Int} ->
-	    {MegaSecs, Secs, MicroSecs} = TimeStamp,
-	    S = MegaSecs * 1000000 + Secs + Int,
-	    MegaSecs1 = S div 1000000,
-	    Secs1 = S rem 1000000,
-	    {MegaSecs1, Secs1, MicroSecs};
-	false ->
-	    never
-    end.
-
-c2s_self_presence({_Pres, #{resend_offline := false}} = Acc) ->
-    Acc;
-c2s_self_presence({#presence{type = available} = NewPres, State} = Acc) ->
-    NewPrio = get_priority_from_presence(NewPres),
-    LastPrio = case maps:get(pres_last, State, error) of
-		   error -> -1;
-		   LastPres -> get_priority_from_presence(LastPres)
-	       end,
-    if LastPrio < 0 andalso NewPrio >= 0 ->
-	    route_offline_messages(State);
-       true ->
-	    ok
-    end,
-    Acc;
-c2s_self_presence(Acc) ->
-    Acc.
-
--spec route_offline_messages(c2s_state()) -> ok.
-route_offline_messages(#{jid := #jid{luser = LUser, lserver = LServer}} = State) ->
-    Mod = gen_mod:db_mod(LServer, ?MODULE),
-    case Mod:pop_messages(LUser, LServer) of
-	{ok, OffMsgs} ->
-	    lists:foreach(
-	      fun(OffMsg) ->
-		      route_offline_message(State, OffMsg)
-	      end, OffMsgs);
-	_ ->
-	    ok
-    end.
-
--spec route_offline_message(c2s_state(), #offline_msg{}) -> ok.
-route_offline_message(#{lserver := LServer} = State,
-		      #offline_msg{expire = Expire} = OffMsg) ->
-    case offline_msg_to_route(LServer, OffMsg) of
-	error ->
-	    ok;
-	{route, Msg} ->
-	    case is_message_expired(Expire, Msg) of
-		true ->
-		    ok;
-		false ->
-		    case privacy_check_packet(State, Msg, in) of
-			allow -> ejabberd_router:route(Msg);
-			deny -> ok
-		    end
-	    end
-    end.
-
--spec is_message_expired(erlang:timestamp() | never, message()) -> boolean().
-is_message_expired(Expire, Msg) ->
-    TS = p1_time_compat:timestamp(),
-    Expire1 = case Expire of
-		  undefined -> find_x_expire(TS, Msg);
-		  _ -> Expire
-	      end,
-    Expire1 /= never andalso Expire1 =< TS.
-
--spec privacy_check_packet(c2s_state(), stanza(), in | out) -> allow | deny.
-privacy_check_packet(#{lserver := LServer} = State, Pkt, Dir) ->
-    ejabberd_hooks:run_fold(privacy_check_packet,
-			    LServer, allow, [State, Pkt, Dir]).
 
 remove_expired_messages(Server) ->
     LServer = jid:nameprep(Server),
-    Mod = gen_mod:db_mod(LServer, ?MODULE),
-    Mod:remove_expired_messages(LServer).
+    remove_expired_messages(LServer,
+			    gen_mod:db_type(LServer, ?MODULE)).
+
+remove_expired_messages(_LServer, mnesia) ->
+    TimeStamp = p1_time_compat:timestamp(),
+    F = fun () ->
+		mnesia:write_lock_table(offline_msg),
+		mnesia:foldl(fun (Rec, _Acc) ->
+				     case Rec#offline_msg.expire of
+				       never -> ok;
+				       TS ->
+					   if TS < TimeStamp ->
+						  mnesia:delete_object(Rec);
+					      true -> ok
+					   end
+				     end
+			     end,
+			     ok, offline_msg)
+	end,
+    mnesia:transaction(F);
+remove_expired_messages(_LServer, odbc) -> {atomic, ok};
+remove_expired_messages(_LServer, riak) -> {atomic, ok}.
 
 remove_old_messages(Days, Server) ->
     LServer = jid:nameprep(Server),
-    Mod = gen_mod:db_mod(LServer, ?MODULE),
-    Mod:remove_old_messages(Days, LServer).
+    remove_old_messages(Days, LServer,
+			gen_mod:db_type(LServer, ?MODULE)).
 
--spec remove_user(binary(), binary()) -> ok.
+remove_old_messages(Days, _LServer, mnesia) ->
+    S = p1_time_compat:system_time(seconds) - 60 * 60 * 24 * Days,
+    MegaSecs1 = S div 1000000,
+    Secs1 = S rem 1000000,
+    TimeStamp = {MegaSecs1, Secs1, 0},
+    F = fun () ->
+		mnesia:write_lock_table(offline_msg),
+		mnesia:foldl(fun (#offline_msg{timestamp = TS} = Rec,
+				  _Acc)
+				     when TS < TimeStamp ->
+				     mnesia:delete_object(Rec);
+				 (_Rec, _Acc) -> ok
+			     end,
+			     ok, offline_msg)
+	end,
+    mnesia:transaction(F);
+
+remove_old_messages(Days, LServer, odbc) ->
+    case catch ejabberd_odbc:sql_query(
+		 LServer,
+		 [<<"DELETE FROM spool"
+		   " WHERE created_at < "
+		   "DATE_SUB(CURDATE(), INTERVAL ">>,
+		  integer_to_list(Days), <<" DAY);">>]) of
+	{updated, N} ->
+	    ?INFO_MSG("~p message(s) deleted from offline spool", [N]);
+	_Error ->
+	    ?ERROR_MSG("Cannot delete message in offline spool: ~p", [_Error])
+    end,
+    {atomic, ok};
+remove_old_messages(_Days, _LServer, riak) ->
+    {atomic, ok}.
+
 remove_user(User, Server) ->
     LUser = jid:nodeprep(User),
     LServer = jid:nameprep(Server),
-    Mod = gen_mod:db_mod(LServer, ?MODULE),
-    Mod:remove_user(LUser, LServer),
-    ok.
+    remove_user(LUser, LServer,
+		gen_mod:db_type(LServer, ?MODULE)).
+
+remove_user(LUser, LServer, mnesia) ->
+    US = {LUser, LServer},
+    F = fun () -> mnesia:delete({offline_msg, US}) end,
+    mnesia:transaction(F);
+remove_user(LUser, LServer, odbc) ->
+    odbc_queries:del_spool_msg(LServer, LUser);
+remove_user(LUser, LServer, riak) ->
+    {atomic, ejabberd_riak:delete_by_index(offline_msg,
+                                           <<"us">>, {LUser, LServer})}.
+
+jid_to_binary(#jid{user = U, server = S, resource = R,
+                   luser = LU, lserver = LS, lresource = LR}) ->
+    #jid{user = iolist_to_binary(U),
+         server = iolist_to_binary(S),
+         resource = iolist_to_binary(R),
+         luser = iolist_to_binary(LU),
+         lserver = iolist_to_binary(LS),
+         lresource = iolist_to_binary(LR)}.
+
+update_table() ->
+    Fields = record_info(fields, offline_msg),
+    case mnesia:table_info(offline_msg, attributes) of
+        Fields ->
+            ejabberd_config:convert_table_to_binary(
+              offline_msg, Fields, bag,
+              fun(#offline_msg{us = {U, _}}) -> U end,
+              fun(#offline_msg{us = {U, S},
+                               from = From,
+                               to = To,
+                               packet = El} = R) ->
+                      R#offline_msg{us = {iolist_to_binary(U),
+                                          iolist_to_binary(S)},
+                                    from = jid_to_binary(From),
+                                    to = jid_to_binary(To),
+                                    packet = fxml:to_xmlel(El)}
+              end);
+        _ ->
+            ?INFO_MSG("Recreating offline_msg table", []),
+            mnesia:transform_table(offline_msg, ignore, Fields)
+    end.
 
 %% Helper functions:
 
 %% Warn senders that their messages have been discarded:
--spec discard_warn_sender(message(), full | any()) -> ok.
-discard_warn_sender(Packet, full) ->
-    ErrText = <<"Your contact offline message queue is "
-		"full. The message has been discarded.">>,
-    Lang = xmpp:get_lang(Packet),
-    Err = xmpp:err_resource_constraint(ErrText, Lang),
-    ejabberd_router:route_error(Packet, Err);
-discard_warn_sender(Packet, _) ->
-    ErrText = <<"Database failure">>,
-    Lang = xmpp:get_lang(Packet),
-    Err = xmpp:err_internal_server_error(ErrText, Lang),
-    ejabberd_router:route_error(Packet, Err).
+discard_warn_sender(Msgs) ->
+    lists:foreach(fun (#offline_msg{from = From, to = To,
+				    packet = Packet}) ->
+			  ErrText = <<"Your contact offline message queue is "
+				      "full. The message has been discarded.">>,
+			  Lang = fxml:get_tag_attr_s(<<"xml:lang">>, Packet),
+			  Err = jlib:make_error_reply(Packet,
+						      ?ERRT_RESOURCE_CONSTRAINT(Lang,
+										ErrText)),
+			  ejabberd_router:route(To, From, Err)
+		  end,
+		  Msgs).
 
 webadmin_page(_, Host,
 	      #request{us = _US, path = [<<"user">>, U, <<"queue">>],
@@ -592,89 +879,257 @@ webadmin_page(_, Host,
 webadmin_page(Acc, _, _) -> Acc.
 
 get_offline_els(LUser, LServer) ->
-    [Packet || {_Seq, Packet} <- read_messages(LUser, LServer)].
+    get_offline_els(LUser, LServer, gen_mod:db_type(LServer, ?MODULE)).
 
--spec offline_msg_to_route(binary(), #offline_msg{}) ->
-				  {route, message()} | error.
-offline_msg_to_route(LServer, #offline_msg{from = From, to = To} = R) ->
-    try xmpp:decode(R#offline_msg.packet, ?NS_CLIENT, [ignore_els]) of
-	Pkt ->
-	    Pkt1 = xmpp:set_from_to(Pkt, From, To),
-	    Pkt2 = add_delay_info(Pkt1, LServer, R#offline_msg.timestamp),
-	    {route, Pkt2}
-    catch _:{xmpp_codec, Why} ->
-	    ?ERROR_MSG("failed to decode packet ~p of user ~s: ~s",
-		       [R#offline_msg.packet, jid:encode(To),
-			xmpp:format_error(Why)]),
+get_offline_els(LUser, LServer, DBType)
+  when DBType == mnesia; DBType == riak ->
+    Msgs = read_all_msgs(LUser, LServer, DBType),
+    lists:map(
+      fun(Msg) ->
+              {route, From, To, Packet} = offline_msg_to_route(LServer, Msg),
+              jlib:replace_from_to(From, To, Packet)
+      end, Msgs);
+get_offline_els(LUser, LServer, odbc) ->
+    case catch ejabberd_odbc:sql_query(
+                 LServer,
+                 ?SQL("select @(xml)s from spool where "
+                      "username=%(LUser)s order by seq")) of
+        {selected, Rs} ->
+            lists:flatmap(
+              fun({XML}) ->
+                      case fxml_stream:parse_element(XML) of
+                          #xmlel{} = El ->
+                              case offline_msg_to_route(LServer, El) of
+                                  {route, _, _, NewEl} ->
+                                      [NewEl];
+                                  error ->
+                                      []
+                              end;
+                          _ ->
+                              []
+                      end
+              end, Rs);
+        _ ->
+            []
+    end.
+
+offline_msg_to_route(LServer, #offline_msg{} = R) ->
+    {route, R#offline_msg.from, R#offline_msg.to,
+     jlib:add_delay_info(R#offline_msg.packet, LServer, R#offline_msg.timestamp,
+			 <<"Offline Storage">>)};
+offline_msg_to_route(_LServer, #xmlel{} = El) ->
+    To = jid:from_string(fxml:get_tag_attr_s(<<"to">>, El)),
+    From = jid:from_string(fxml:get_tag_attr_s(<<"from">>, El)),
+    if (To /= error) and (From /= error) ->
+            {route, From, To, El};
+       true ->
+            error
+    end.
+
+binary_to_timestamp(TS) ->
+    case catch jlib:binary_to_integer(TS) of
+	Int when is_integer(Int) ->
+	    Secs = Int div 1000000,
+	    USec = Int rem 1000000,
+	    MSec = Secs div 1000000,
+	    Sec = Secs rem 1000000,
+	    {MSec, Sec, USec};
+	_ ->
+	    undefined
+    end.
+
+timestamp_to_binary({MS, S, US}) ->
+    format_timestamp(integer_to_list((MS * 1000000 + S) * 1000000 + US)).
+
+format_timestamp(TS) ->
+    iolist_to_binary(io_lib:format("~20..0s", [TS])).
+
+offline_msg_to_header(#offline_msg{from = From, timestamp = Int} = Msg) ->
+    TS = timestamp_to_binary(Int),
+    From_s = jid:to_string(From),
+    {<<TS/binary, "+", From_s/binary>>, From_s, Msg}.
+
+read_message_headers(LUser, LServer) ->
+    DBType = gen_mod:db_type(LServer, ?MODULE),
+    read_message_headers(LUser, LServer, DBType).
+
+read_message_headers(LUser, LServer, mnesia) ->
+    Msgs = mnesia:dirty_read({offline_msg, {LUser, LServer}}),
+    Hdrs = lists:map(fun offline_msg_to_header/1, Msgs),
+    lists:keysort(1, Hdrs);
+read_message_headers(LUser, LServer, riak) ->
+    case ejabberd_riak:get_by_index(
+           offline_msg, offline_msg_schema(),
+	   <<"us">>, {LUser, LServer}) of
+        {ok, Rs} ->
+	    Hdrs = lists:map(fun offline_msg_to_header/1, Rs),
+	    lists:keysort(1, Hdrs);
+	_Err ->
+	    []
+    end;
+read_message_headers(LUser, LServer, odbc) ->
+    Username = ejabberd_odbc:escape(LUser),
+    case catch ejabberd_odbc:sql_query(
+		 LServer, [<<"select xml, seq from spool where username ='">>,
+			   Username, <<"' order by seq;">>]) of
+	{selected, [<<"xml">>, <<"seq">>], Rows} ->
+	    Hdrs = lists:flatmap(
+		     fun([XML, Seq]) ->
+			     try
+				 #xmlel{} = El = fxml_stream:parse_element(XML),
+				 From = fxml:get_tag_attr_s(<<"from">>, El),
+				 #jid{} = jid:from_string(From),
+				 TS = format_timestamp(Seq),
+				 [{<<TS/binary, "+", From/binary>>, From, El}]
+			     catch _:_ -> []
+			     end
+		     end, Rows),
+	    lists:keysort(1, Hdrs);
+	_Err ->
+	    []
+    end.
+
+read_message(_From, To, TS, mnesia) ->
+    {U, S, _} = jid:tolower(To),
+    case mnesia:dirty_match_object(
+	   offline_msg, #offline_msg{us = {U, S}, timestamp = TS, _ = '_'}) of
+	[Msg|_] ->
+	    {ok, Msg};
+	_ ->
+	    error
+    end;
+read_message(_From, _To, TS, riak) ->
+    case ejabberd_riak:get(offline_msg, offline_msg_schema(), TS) of
+	{ok, Msg} ->
+	    {ok, Msg};
+	_ ->
+	    error
+    end;
+read_message(_From, To, Seq, odbc) ->
+    {LUser, LServer, _} = jid:tolower(To),
+    Username = ejabberd_odbc:escape(LUser),
+    SSeq = ejabberd_odbc:escape(Seq),
+    case ejabberd_odbc:sql_query(
+	   LServer,
+	   [<<"select xml from spool  where username='">>, Username,
+	    <<"'  and seq='">>, SSeq, <<"';">>]) of
+	{selected, [<<"xml">>], [[RawXML]|_]} ->
+	    case fxml_stream:parse_element(RawXML) of
+		#xmlel{} = El -> {ok, El};
+		{error, _} -> error
+	    end;
+	_ ->
 	    error
     end.
 
--spec read_messages(binary(), binary()) -> [{binary(), message()}].
-read_messages(LUser, LServer) ->
-    Mod = gen_mod:db_mod(LServer, ?MODULE),
-    lists:flatmap(
-      fun({Seq, From, To, TS, El}) ->
-	      Node = integer_to_binary(Seq),
-	      try xmpp:decode(El, ?NS_CLIENT, [ignore_els]) of
-		  Pkt ->
-		      Node = integer_to_binary(Seq),
-		      Pkt1 = add_delay_info(Pkt, LServer, TS),
-		      Pkt2 = xmpp:set_from_to(Pkt1, From, To),
-		      [{Node, Pkt2}]
-	      catch _:{xmpp_codec, Why} ->
-		      ?ERROR_MSG("failed to decode packet ~p "
-				 "of user ~s: ~s",
-				 [El, jid:encode(To),
-				  xmpp:format_error(Why)]),
-		      []
-	      end
-      end, Mod:read_message_headers(LUser, LServer)).
+remove_message(_From, To, TS, mnesia) ->
+    {U, S, _} = jid:tolower(To),
+    Msgs = mnesia:dirty_match_object(
+	     offline_msg, #offline_msg{us = {U, S}, timestamp = TS, _ = '_'}),
+    lists:foreach(
+      fun(Msg) ->
+	      mnesia:dirty_delete_object(Msg)
+      end, Msgs);
+remove_message(_From, _To, TS, riak) ->
+    ejabberd_riak:delete(offline_msg, TS),
+    ok;
+remove_message(_From, To, Seq, odbc) ->
+    {LUser, LServer, _} = jid:tolower(To),
+    Username = ejabberd_odbc:escape(LUser),
+    SSeq = ejabberd_odbc:escape(Seq),
+    ejabberd_odbc:sql_query(
+      LServer,
+      [<<"delete from spool  where username='">>, Username,
+       <<"'  and seq='">>, SSeq, <<"';">>]),
+    ok.
 
-format_user_queue(Hdrs) ->
-    lists:map(
-      fun({Seq, From, To, TS, El}) ->
-	      ID = integer_to_binary(Seq),
-	      FPacket = ejabberd_web_admin:pretty_print_xml(El),
-	      SFrom = jid:encode(From),
-	      STo = jid:encode(To),
-	      Time = case TS of
-			 undefined ->
-			     Stamp = fxml:get_path_s(El, [{elem, <<"delay">>},
-							  {attr, <<"stamp">>}]),
-			     try xmpp_util:decode_timestamp(Stamp) of
-				 {_, _, _} = Now -> format_time(Now)
-			     catch _:_ ->
-				     <<"">>
-			     end;
-			 {_, _, _} = Now ->
-			     format_time(Now)
-		     end,
-	      ?XE(<<"tr">>,
-		  [?XAE(<<"td">>, [{<<"class">>, <<"valign">>}],
-			[?INPUT(<<"checkbox">>, <<"selected">>, ID)]),
-		   ?XAC(<<"td">>, [{<<"class">>, <<"valign">>}], Time),
-		   ?XAC(<<"td">>, [{<<"class">>, <<"valign">>}], SFrom),
-		   ?XAC(<<"td">>, [{<<"class">>, <<"valign">>}], STo),
-		   ?XAE(<<"td">>, [{<<"class">>, <<"valign">>}],
-			[?XC(<<"pre">>, FPacket)])])
-      end, Hdrs).
+read_all_msgs(LUser, LServer, mnesia) ->
+    US = {LUser, LServer},
+    lists:keysort(#offline_msg.timestamp,
+		  mnesia:dirty_read({offline_msg, US}));
+read_all_msgs(LUser, LServer, riak) ->
+    case ejabberd_riak:get_by_index(
+           offline_msg, offline_msg_schema(),
+	   <<"us">>, {LUser, LServer}) of
+        {ok, Rs} ->
+            lists:keysort(#offline_msg.timestamp, Rs);
+        _Err ->
+            []
+    end;
+read_all_msgs(LUser, LServer, odbc) ->
+    case catch ejabberd_odbc:sql_query(
+                 LServer,
+                 ?SQL("select @(xml)s from spool where "
+                      "username=%(LUser)s order by seq")) of
+        {selected, Rs} ->
+            lists:flatmap(
+              fun({XML}) ->
+                      case fxml_stream:parse_element(XML) of
+                          {error, _Reason} -> [];
+                          El -> [El]
+                      end
+              end,
+              Rs);
+        _ -> []
+    end.
 
-format_time(Now) ->
-    {{Year, Month, Day}, {Hour, Minute, Second}} = calendar:now_to_local_time(Now),
-    str:format("~w-~.2.0w-~.2.0w ~.2.0w:~.2.0w:~.2.0w",
-	       [Year, Month, Day, Hour, Minute,	Second]).
+format_user_queue(Msgs, DBType) when DBType == mnesia; DBType == riak ->
+    lists:map(fun (#offline_msg{timestamp = TimeStamp,
+				from = From, to = To,
+				packet =
+				    #xmlel{name = Name, attrs = Attrs,
+					   children = Els}} =
+		       Msg) ->
+		      ID = jlib:encode_base64((term_to_binary(Msg))),
+		      {{Year, Month, Day}, {Hour, Minute, Second}} =
+			  calendar:now_to_local_time(TimeStamp),
+		      Time =
+			  iolist_to_binary(io_lib:format("~w-~.2.0w-~.2.0w ~.2.0w:~.2.0w:~.2.0w",
+							 [Year, Month, Day,
+							  Hour, Minute,
+							  Second])),
+		      SFrom = jid:to_string(From),
+		      STo = jid:to_string(To),
+		      Attrs2 = jlib:replace_from_to_attrs(SFrom, STo, Attrs),
+		      Packet = #xmlel{name = Name, attrs = Attrs2,
+				      children = Els},
+		      FPacket = ejabberd_web_admin:pretty_print_xml(Packet),
+		      ?XE(<<"tr">>,
+			  [?XAE(<<"td">>, [{<<"class">>, <<"valign">>}],
+				[?INPUT(<<"checkbox">>, <<"selected">>, ID)]),
+			   ?XAC(<<"td">>, [{<<"class">>, <<"valign">>}], Time),
+			   ?XAC(<<"td">>, [{<<"class">>, <<"valign">>}], SFrom),
+			   ?XAC(<<"td">>, [{<<"class">>, <<"valign">>}], STo),
+			   ?XAE(<<"td">>, [{<<"class">>, <<"valign">>}],
+				[?XC(<<"pre">>, FPacket)])])
+	      end,
+	      Msgs);
+format_user_queue(Msgs, odbc) ->
+    lists:map(fun (#xmlel{} = Msg) ->
+		      ID = jlib:encode_base64((term_to_binary(Msg))),
+		      Packet = Msg,
+		      FPacket = ejabberd_web_admin:pretty_print_xml(Packet),
+		      ?XE(<<"tr">>,
+			  [?XAE(<<"td">>, [{<<"class">>, <<"valign">>}],
+				[?INPUT(<<"checkbox">>, <<"selected">>, ID)]),
+			   ?XAE(<<"td">>, [{<<"class">>, <<"valign">>}],
+				[?XC(<<"pre">>, FPacket)])])
+	      end,
+	      Msgs).
 
 user_queue(User, Server, Query, Lang) ->
     LUser = jid:nodeprep(User),
     LServer = jid:nameprep(Server),
     US = {LUser, LServer},
-    Mod = gen_mod:db_mod(LServer, ?MODULE),
-    Res = user_queue_parse_query(LUser, LServer, Query),
-    HdrsAll = Mod:read_message_headers(LUser, LServer),
-    Hdrs = get_messages_subset(US, Server, HdrsAll),
-    FMsgs = format_user_queue(Hdrs),
+    DBType = gen_mod:db_type(LServer, ?MODULE),
+    Res = user_queue_parse_query(LUser, LServer, Query,
+				 DBType),
+    MsgsAll = read_all_msgs(LUser, LServer, DBType),
+    Msgs = get_messages_subset(US, Server, MsgsAll,
+			       DBType),
+    FMsgs = format_user_queue(Msgs, DBType),
     [?XC(<<"h1">>,
-	 (str:format(?T(<<"~s's Offline Messages Queue">>),
+	 list_to_binary(io_lib:format(?T(<<"~s's Offline Messages Queue">>),
                                       [us_to_list(US)])))]
       ++
       case Res of
@@ -702,58 +1157,148 @@ user_queue(User, Server, Query, Lang) ->
 	       ?INPUTT(<<"submit">>, <<"delete">>,
 		       <<"Delete Selected">>)])].
 
-user_queue_parse_query(LUser, LServer, Query) ->
-    Mod = gen_mod:db_mod(LServer, ?MODULE),
+user_queue_parse_query(LUser, LServer, Query, mnesia) ->
+    US = {LUser, LServer},
     case lists:keysearch(<<"delete">>, 1, Query) of
-	{value, _} ->
-	    case lists:keyfind(<<"selected">>, 1, Query) of
-		{_, Seq} ->
-		    case catch binary_to_integer(Seq) of
-			I when is_integer(I), I>=0 ->
-			    Mod:remove_message(LUser, LServer, I),
-			    ok;
-			_ ->
-			    nothing
-		    end;
-		false ->
-		    nothing
-	    end;
-	_ ->
-	    nothing
+      {value, _} ->
+	  Msgs = lists:keysort(#offline_msg.timestamp,
+			       mnesia:dirty_read({offline_msg, US})),
+	  F = fun () ->
+		      lists:foreach(fun (Msg) ->
+					    ID =
+						jlib:encode_base64((term_to_binary(Msg))),
+					    case lists:member({<<"selected">>,
+							       ID},
+							      Query)
+						of
+					      true -> mnesia:delete_object(Msg);
+					      false -> ok
+					    end
+				    end,
+				    Msgs)
+	      end,
+	  mnesia:transaction(F),
+	  ok;
+      false -> nothing
+    end;
+user_queue_parse_query(LUser, LServer, Query, riak) ->
+    case lists:keysearch(<<"delete">>, 1, Query) of
+        {value, _} ->
+            Msgs = read_all_msgs(LUser, LServer, riak),
+            lists:foreach(
+              fun (Msg) ->
+                      ID = jlib:encode_base64((term_to_binary(Msg))),
+                      case lists:member({<<"selected">>, ID}, Query) of
+                          true ->
+                              ejabberd_riak:delete(offline_msg,
+                                                   Msg#offline_msg.timestamp);
+                          false ->
+                              ok
+                      end
+              end,
+              Msgs),
+            ok;
+        false ->
+            nothing
+    end;
+user_queue_parse_query(LUser, LServer, Query, odbc) ->
+    Username = ejabberd_odbc:escape(LUser),
+    case lists:keysearch(<<"delete">>, 1, Query) of
+      {value, _} ->
+	  Msgs = case catch ejabberd_odbc:sql_query(LServer,
+						    [<<"select xml, seq from spool  where username='">>,
+						     Username,
+						     <<"'  order by seq;">>])
+		     of
+		   {selected, [<<"xml">>, <<"seq">>], Rs} ->
+		       lists:flatmap(fun ([XML, Seq]) ->
+					     case fxml_stream:parse_element(XML)
+						 of
+					       {error, _Reason} -> [];
+					       El -> [{El, Seq}]
+					     end
+				     end,
+				     Rs);
+		   _ -> []
+		 end,
+	  F = fun () ->
+		      lists:foreach(fun ({Msg, Seq}) ->
+					    ID =
+						jlib:encode_base64((term_to_binary(Msg))),
+					    case lists:member({<<"selected">>,
+							       ID},
+							      Query)
+						of
+					      true ->
+						  SSeq =
+						      ejabberd_odbc:escape(Seq),
+						  catch
+						    ejabberd_odbc:sql_query(LServer,
+									    [<<"delete from spool  where username='">>,
+									     Username,
+									     <<"'  and seq='">>,
+									     SSeq,
+									     <<"';">>]);
+					      false -> ok
+					    end
+				    end,
+				    Msgs)
+	      end,
+	  mnesia:transaction(F),
+	  ok;
+      false -> nothing
     end.
 
 us_to_list({User, Server}) ->
-    jid:encode({User, Server, <<"">>}).
+    jid:to_string({User, Server, <<"">>}).
 
 get_queue_length(LUser, LServer) ->
     count_offline_messages(LUser, LServer).
 
-get_messages_subset(User, Host, MsgsAll) ->
-    MaxOfflineMsgs = case get_max_user_messages(User, Host) of
+get_messages_subset(User, Host, MsgsAll, DBType) ->
+    Access = gen_mod:get_module_opt(Host, ?MODULE, access_max_user_messages,
+                                    fun(A) when is_atom(A) -> A end,
+				    max_user_offline_messages),
+    MaxOfflineMsgs = case get_max_user_messages(Access,
+						User, Host)
+			 of
 		       Number when is_integer(Number) -> Number;
 		       _ -> 100
 		     end,
     Length = length(MsgsAll),
-    get_messages_subset2(MaxOfflineMsgs, Length, MsgsAll).
+    get_messages_subset2(MaxOfflineMsgs, Length, MsgsAll,
+			 DBType).
 
-get_messages_subset2(Max, Length, MsgsAll) when Length =< Max * 2 ->
+get_messages_subset2(Max, Length, MsgsAll, _DBType)
+    when Length =< Max * 2 ->
     MsgsAll;
-get_messages_subset2(Max, Length, MsgsAll) ->
+get_messages_subset2(Max, Length, MsgsAll, DBType)
+  when DBType == mnesia; DBType == riak ->
     FirstN = Max,
     {MsgsFirstN, Msgs2} = lists:split(FirstN, MsgsAll),
     MsgsLastN = lists:nthtail(Length - FirstN - FirstN,
 			      Msgs2),
-    NoJID = jid:make(<<"...">>, <<"...">>),
-    Seq = <<"0">>,
+    NoJID = jid:make(<<"...">>, <<"...">>, <<"">>),
+    IntermediateMsg = #offline_msg{timestamp = p1_time_compat:timestamp(),
+				   from = NoJID, to = NoJID,
+				   packet =
+				       #xmlel{name = <<"...">>, attrs = [],
+					      children = []}},
+    MsgsFirstN ++ [IntermediateMsg] ++ MsgsLastN;
+get_messages_subset2(Max, Length, MsgsAll, odbc) ->
+    FirstN = Max,
+    {MsgsFirstN, Msgs2} = lists:split(FirstN, MsgsAll),
+    MsgsLastN = lists:nthtail(Length - FirstN - FirstN,
+			      Msgs2),
     IntermediateMsg = #xmlel{name = <<"...">>, attrs = [],
 			     children = []},
-    MsgsFirstN ++ [{Seq, NoJID, NoJID, IntermediateMsg}] ++ MsgsLastN.
+    MsgsFirstN ++ [IntermediateMsg] ++ MsgsLastN.
 
 webadmin_user(Acc, User, Server, Lang) ->
     QueueLen = count_offline_messages(jid:nodeprep(User),
 				jid:nameprep(Server)),
     FQueueLen = [?AC(<<"queue/">>,
-		     (integer_to_binary(QueueLen)))],
+		     (iolist_to_binary(integer_to_list(QueueLen))))],
     Acc ++
       [?XCT(<<"h3">>, <<"Offline Messages:">>)] ++
 	FQueueLen ++
@@ -761,87 +1306,159 @@ webadmin_user(Acc, User, Server, Lang) ->
 	   ?INPUTT(<<"submit">>, <<"removealloffline">>,
 		   <<"Remove All Offline Messages">>)].
 
--spec delete_all_msgs(binary(), binary()) -> {atomic, any()}.
 delete_all_msgs(User, Server) ->
     LUser = jid:nodeprep(User),
     LServer = jid:nameprep(Server),
-    Mod = gen_mod:db_mod(LServer, ?MODULE),
-    Mod:remove_all_messages(LUser, LServer).
+    delete_all_msgs(LUser, LServer,
+		    gen_mod:db_type(LServer, ?MODULE)).
+
+delete_all_msgs(LUser, LServer, mnesia) ->
+    US = {LUser, LServer},
+    F = fun () ->
+		mnesia:write_lock_table(offline_msg),
+		lists:foreach(fun (Msg) -> mnesia:delete_object(Msg)
+			      end,
+			      mnesia:dirty_read({offline_msg, US}))
+	end,
+    mnesia:transaction(F);
+delete_all_msgs(LUser, LServer, riak) ->
+    Res = ejabberd_riak:delete_by_index(offline_msg,
+                                        <<"us">>, {LUser, LServer}),
+    {atomic, Res};
+delete_all_msgs(LUser, LServer, odbc) ->
+    odbc_queries:del_spool_msg(LServer, LUser),
+    {atomic, ok}.
 
 webadmin_user_parse_query(_, <<"removealloffline">>,
 			  User, Server, _Query) ->
     case delete_all_msgs(User, Server) of
-	{atomic, ok} ->
-	    ?INFO_MSG("Removed all offline messages for ~s@~s",
-		      [User, Server]),
-	    {stop, ok};
-	Err ->
-	    ?ERROR_MSG("Failed to remove offline messages: ~p",
-		       [Err]),
-	    {stop, error}
+      {aborted, Reason} ->
+	  ?ERROR_MSG("Failed to remove offline messages: ~p",
+		     [Reason]),
+	  {stop, error};
+      {atomic, ok} ->
+	  ?INFO_MSG("Removed all offline messages for ~s@~s",
+		    [User, Server]),
+	  {stop, ok}
     end;
 webadmin_user_parse_query(Acc, _Action, _User, _Server,
 			  _Query) ->
     Acc.
 
 %% Returns as integer the number of offline messages for a given user
--spec count_offline_messages(binary(), binary()) -> non_neg_integer().
 count_offline_messages(User, Server) ->
     LUser = jid:nodeprep(User),
     LServer = jid:nameprep(Server),
-    Mod = gen_mod:db_mod(LServer, ?MODULE),
-    Mod:count_messages(LUser, LServer).
+    DBType = gen_mod:db_type(LServer, ?MODULE),
+    count_offline_messages(LUser, LServer, DBType).
 
--spec add_delay_info(message(), binary(),
-		     undefined | erlang:timestamp()) -> message().
-add_delay_info(Packet, LServer, TS) ->
-    NewTS = case TS of
-		undefined -> p1_time_compat:timestamp();
-		_ -> TS
-	    end,
-    Packet1 = xmpp:put_meta(Packet, from_offline, true),
-    xmpp_util:add_delay_info(Packet1, jid:make(LServer), NewTS,
-			     <<"Offline storage">>).
-
--spec get_priority_from_presence(presence()) -> integer().
-get_priority_from_presence(#presence{priority = Prio}) ->
-    case Prio of
-	undefined -> 0;
-	_ -> Prio
+count_offline_messages(LUser, LServer, mnesia) ->
+    US = {LUser, LServer},
+    F = fun () ->
+		count_mnesia_records(US)
+	end,
+    case catch mnesia:async_dirty(F) of
+      I when is_integer(I) -> I;
+      _ -> 0
+    end;
+count_offline_messages(LUser, LServer, odbc) ->
+    case catch ejabberd_odbc:sql_query(
+                 LServer,
+                 ?SQL("select @(count(*))d from spool "
+                      "where username=%(LUser)s")) of
+        {selected, [{Res}]} ->
+            Res;
+        _ -> 0
+    end;
+count_offline_messages(LUser, LServer, riak) ->
+    case ejabberd_riak:count_by_index(
+           offline_msg, <<"us">>, {LUser, LServer}) of
+        {ok, Res} ->
+            Res;
+        _ ->
+            0
     end.
 
-export(LServer) ->
-    Mod = gen_mod:db_mod(LServer, ?MODULE),
-    Mod:export(LServer).
+%% Return the number of records matching a given match expression.
+%% This function is intended to be used inside a Mnesia transaction.
+%% The count has been written to use the fewest possible memory by
+%% getting the record by small increment and by using continuation.
+-define(BATCHSIZE, 100).
 
-import_info() ->
-    [{<<"spool">>, 4}].
+count_mnesia_records(US) ->
+    MatchExpression = #offline_msg{us = US,  _ = '_'},
+    case mnesia:select(offline_msg, [{MatchExpression, [], [[]]}],
+		       ?BATCHSIZE, read) of
+	{Result, Cont} ->
+	    Count = length(Result),
+	    count_records_cont(Cont, Count);
+	'$end_of_table' ->
+	    0
+    end.
 
-import_start(LServer, DBType) ->
-    Mod = gen_mod:db_mod(DBType, ?MODULE),
-    Mod:import(LServer, []).
+count_records_cont(Cont, Count) ->
+    case mnesia:select(Cont) of
+	{Result, Cont} ->
+	    NewCount = Count + length(Result),
+	    count_records_cont(Cont, NewCount);
+	'$end_of_table' ->
+	    Count
+    end.
 
-import(LServer, {sql, _}, DBType, <<"spool">>,
-       [LUser, XML, _Seq, _TimeStamp]) ->
-    El = fxml_stream:parse_element(XML),
-    #message{from = From, to = To} = Msg = xmpp:decode(El, ?NS_CLIENT, [ignore_els]),
-    TS = case xmpp:get_subtag(Msg, #delay{stamp = {0,0,0}}) of
-	     #delay{stamp = {MegaSecs, Secs, _}} ->
-		 {MegaSecs, Secs, 0};
-	     false ->
-		 p1_time_compat:timestamp()
-	 end,
-    US = {LUser, LServer},
-    Expire = find_x_expire(TS, Msg),
-    OffMsg = #offline_msg{us = US, packet = El,
-			  from = From, to = To,
-			  timestamp = TS, expire = Expire},
-    Mod = gen_mod:db_mod(DBType, ?MODULE),
-    Mod:import(OffMsg).
+offline_msg_schema() ->
+    {record_info(fields, offline_msg), #offline_msg{}}.
+
+export(_Server) ->
+    [{offline_msg,
+      fun(Host, #offline_msg{us = {LUser, LServer},
+                             timestamp = TimeStamp, from = From, to = To,
+                             packet = Packet})
+            when LServer == Host ->
+              Username = ejabberd_odbc:escape(LUser),
+              Packet1 = jlib:replace_from_to(From, To, Packet),
+              Packet2 = jlib:add_delay_info(Packet1, LServer, TimeStamp,
+                                            <<"Offline Storage">>),
+              XML = ejabberd_odbc:escape(fxml:element_to_binary(Packet2)),
+              [[<<"delete from spool where username='">>, Username, <<"';">>],
+               [<<"insert into spool(username, xml) values ('">>,
+                Username, <<"', '">>, XML, <<"');">>]];
+         (_Host, _R) ->
+              []
+      end}].
+
+import(LServer) ->
+    [{<<"select username, xml from spool;">>,
+      fun([LUser, XML]) ->
+              El = #xmlel{} = fxml_stream:parse_element(XML),
+              From = #jid{} = jid:from_string(
+                                fxml:get_attr_s(<<"from">>, El#xmlel.attrs)),
+              To = #jid{} = jid:from_string(
+                              fxml:get_attr_s(<<"to">>, El#xmlel.attrs)),
+              Stamp = fxml:get_path_s(El, [{elem, <<"delay">>},
+                                          {attr, <<"stamp">>}]),
+              TS = case jlib:datetime_string_to_timestamp(Stamp) of
+                       {_, _, _} = Now ->
+                           Now;
+                       undefined ->
+                           p1_time_compat:timestamp()
+                   end,
+              Expire = find_x_expire(TS, El#xmlel.children),
+              #offline_msg{us = {LUser, LServer},
+                           from = From, to = To,
+                           timestamp = TS, expire = Expire}
+      end}].
+
+import(_LServer, mnesia, #offline_msg{} = Msg) ->
+    mnesia:dirty_write(Msg);
+import(_LServer, riak, #offline_msg{us = US, timestamp = TS} = M) ->
+    ejabberd_riak:put(M, offline_msg_schema(),
+		      [{i, TS}, {'2i', [{<<"us">>, US}]}]);
+import(_, _, _) ->
+    pass.
 
 mod_opt_type(access_max_user_messages) ->
-    fun acl:shaper_rules_validator/1;
-mod_opt_type(db_type) -> fun(T) -> ejabberd_config:v_db(?MODULE, T) end;
+    fun (A) -> A end;
+mod_opt_type(db_type) -> fun gen_mod:v_db/1;
 mod_opt_type(store_empty_body) ->
     fun (V) when is_boolean(V) -> V;
         (unless_chat_state) -> unless_chat_state

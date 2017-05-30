@@ -126,15 +126,14 @@
 -record(eldap,
 	{version = ?LDAP_VERSION :: non_neg_integer(),
          hosts = []              :: [binary()],
-         host = undefined        :: binary() | undefined,
+         host                    :: binary(),
 	 port = 389              :: inet:port_number(),
          sockmod = gen_tcp       :: ssl | gen_tcp,
          tls = none              :: none | tls,
-         tls_options = []        :: [{certfile, string()} |
-				     {cacertfile, string()} |
+         tls_options = []        :: [{cacertfile, string()} |
                                      {depth, non_neg_integer()} |
                                      {verify, non_neg_integer()}],
-	 fd                      :: gen_tcp:socket() | undefined,
+	 fd,
          rootdn = <<"">>         :: binary(),
          passwd = <<"">>         :: binary(),
          id = 0                  :: non_neg_integer(),
@@ -146,7 +145,7 @@
 %%% API
 %%%----------------------------------------------------------------------
 start_link(Name) ->
-    Reg_name = misc:binary_to_atom(<<"eldap_",
+    Reg_name = jlib:binary_to_atom(<<"eldap_",
 				       Name/binary>>),
     gen_fsm:start_link({local, Reg_name}, ?MODULE, [], []).
 
@@ -154,7 +153,7 @@ start_link(Name) ->
                  binary(), tlsopts()) -> any().
 
 start_link(Name, Hosts, Port, Rootdn, Passwd, Opts) ->
-    Reg_name = misc:binary_to_atom(<<"eldap_",
+    Reg_name = jlib:binary_to_atom(<<"eldap_",
 				       Name/binary>>),
     gen_fsm:start_link({local, Reg_name}, ?MODULE,
 		       [Hosts, Port, Rootdn, Passwd, Opts], []).
@@ -549,7 +548,7 @@ extensibleMatch_opts([], MRA) -> MRA.
 get_handle(Pid) when is_pid(Pid) -> Pid;
 get_handle(Atom) when is_atom(Atom) -> Atom;
 get_handle(Name) when is_binary(Name) ->
-    misc:binary_to_atom(<<"eldap_",
+    jlib:binary_to_atom(<<"eldap_",
 			    Name/binary>>).
 
 %%%----------------------------------------------------------------------
@@ -566,7 +565,11 @@ get_handle(Name) when is_binary(Name) ->
 %% process.      
 %%----------------------------------------------------------------------
 init([Hosts, Port, Rootdn, Passwd, Opts]) ->
-    Encrypt = case proplists:get_value(encrypt, Opts) of
+    Encrypt = case gen_mod:get_opt(encrypt, Opts,
+                                   fun(tls) -> tls;
+                                      (starttls) -> starttls;
+                                      (none) -> none
+                                   end) of
                   tls -> tls;
                   _ -> none
 	      end,
@@ -578,36 +581,46 @@ init([Hosts, Port, Rootdn, Passwd, Opts]) ->
 		     end;
 		 PT -> PT
 	       end,
-    CertOpts = case proplists:get_value(tls_certfile, Opts) of
-		   undefined ->
-		       [];
-		   Path1 ->
-		       [{certfile, Path1}]
-	       end,
-    CacertOpts = case proplists:get_value(tls_cacertfile, Opts) of
+    CacertOpts = case gen_mod:get_opt(
+                        tls_cacertfile, Opts,
+                        fun(S) when is_binary(S) ->
+                                binary_to_list(S);
+                           (undefined) ->
+                                undefined
+                        end) of
                      undefined ->
                          [];
-                     Path2 ->
-                         [{cacertfile, Path2}]
+                     Path ->
+                         [{cacertfile, Path}]
                  end,
-    DepthOpts = case proplists:get_value(tls_depth, Opts) of
+    DepthOpts = case gen_mod:get_opt(
+                       tls_depth, Opts,
+                       fun(I) when is_integer(I), I>=0 ->
+                               I;
+                          (undefined) ->
+                               undefined
+                       end) of
                     undefined ->
                         [];
                     Depth ->
                         [{depth, Depth}]
                 end,
-    Verify = proplists:get_value(tls_verify, Opts, false),
+    Verify = gen_mod:get_opt(tls_verify, Opts,
+                             fun(hard) -> hard;
+                                (soft) -> soft;
+                                (false) -> false
+                             end, false),
     TLSOpts = if (Verify == hard orelse Verify == soft)
 		   andalso CacertOpts == [] ->
 		     ?WARNING_MSG("TLS verification is enabled but no CA "
 				  "certfiles configured, so verification "
 				  "is disabled.",
 				  []),
-		     CertOpts;
+		     [];
 		 Verify == soft ->
-		     [{verify, 1}] ++ CertOpts ++ CacertOpts ++ DepthOpts;
+		     [{verify, 1}] ++ CacertOpts ++ DepthOpts;
 		 Verify == hard ->
-		     [{verify, 2}] ++ CertOpts ++ CacertOpts ++ DepthOpts;
+		     [{verify, 2}] ++ CacertOpts ++ DepthOpts;
 		 true -> []
 	      end,
     {ok, connecting,

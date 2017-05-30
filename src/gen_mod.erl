@@ -5,7 +5,7 @@
 %%% Created : 24 Jan 2003 by Alexey Shchepin <alexey@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2016   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -26,90 +26,44 @@
 -module(gen_mod).
 
 -behaviour(ejabberd_config).
--behaviour(supervisor).
 
 -author('alexey@process-one.net').
 
--export([init/1, start_link/0, start_child/3, start_child/4,
-	 stop_child/1, stop_child/2, config_reloaded/0]).
--export([start_module/2, start_module/3,
-	 stop_module/2, stop_module_keep_config/2,
-	 get_opt/2, get_opt/3, get_opt_host/3, opt_type/1, is_equal_opt/4,
-	 get_module_opt/3, get_module_opt/4, get_module_opt_host/3,
+-export([start/0, start_module/2, start_module/3,
+	 stop_module/2, stop_module_keep_config/2, get_opt/3,
+	 get_opt/4, get_opt_host/3, db_type/1, db_type/2,
+	 get_module_opt/4, get_module_opt/5, get_module_opt_host/3,
 	 loaded_modules/1, loaded_modules_with_opts/1,
-	 get_hosts/2, get_module_proc/2, is_loaded/2, is_loaded_elsewhere/2,
+	 get_hosts/2, get_module_proc/2, is_loaded/2,
 	 start_modules/0, start_modules/1, stop_modules/0, stop_modules/1,
-	 db_mod/2, db_mod/3, ram_db_mod/2, ram_db_mod/3,
-	 db_type/2, db_type/3, ram_db_type/2, ram_db_type/3]).
+	 default_db/1, v_db/1, opt_type/1]).
 
-%% Deprecated functions
--export([get_opt/4, get_module_opt/5]).
--deprecated([{get_opt, 4}, {get_module_opt, 5}]).
+%%-export([behaviour_info/1]).
 
 -include("ejabberd.hrl").
 -include("logger.hrl").
--include_lib("stdlib/include/ms_transform.hrl").
 
 -record(ejabberd_module,
         {module_host = {undefined, <<"">>} :: {atom(), binary()},
          opts = [] :: opts() | '_' | '$2'}).
 
 -type opts() :: [{atom(), any()}].
--type db_type() :: atom().
+-type db_type() :: odbc | mnesia | riak.
 
--callback start(binary(), opts()) -> ok | {ok, pid()}.
+-callback start(binary(), opts()) -> any().
 -callback stop(binary()) -> any().
--callback reload(binary(), opts(), opts()) -> ok | {ok, pid()}.
--callback mod_opt_type(atom()) -> fun((term()) -> term()) | [atom()].
--callback depends(binary(), opts()) -> [{module(), hard | soft}].
-
--optional_callbacks([reload/3]).
 
 -export_type([opts/0]).
 -export_type([db_type/0]).
 
--ifndef(GEN_SERVER).
--define(GEN_SERVER, gen_server).
--endif.
+%%behaviour_info(callbacks) -> [{start, 2}, {stop, 1}];
+%%behaviour_info(_Other) -> undefined.
 
-start_link() ->
-    case supervisor:start_link({local, ejabberd_gen_mod_sup}, ?MODULE, []) of
-	{ok, Pid} ->
-	    start_modules(),
-	    {ok, Pid};
-	Err ->
-	    Err
-    end.
-
-init([]) ->
-    ejabberd_hooks:add(config_reloaded, ?MODULE, config_reloaded, 50),
-    ejabberd_hooks:add(host_up, ?MODULE, start_modules, 40),
-    ejabberd_hooks:add(host_down, ?MODULE, stop_modules, 70),
+start() ->
     ets:new(ejabberd_modules,
 	    [named_table, public,
-	     {keypos, #ejabberd_module.module_host},
-	     {read_concurrency, true}]),
-    {ok, {{one_for_one, 10, 1}, []}}.
-
--spec start_child(module(), binary() | global, opts()) -> ok | {error, any()}.
-start_child(Mod, Host, Opts) ->
-    start_child(Mod, Host, Opts, get_module_proc(Host, Mod)).
-
--spec start_child(module(), binary() | global, opts(), atom()) -> ok | {error, any()}.
-start_child(Mod, Host, Opts, Proc) ->
-    Spec = {Proc, {?GEN_SERVER, start_link,
-		   [{local, Proc}, Mod, [Host, Opts], []]},
-            transient, timer:minutes(1), worker, [Mod]},
-    supervisor:start_child(ejabberd_gen_mod_sup, Spec).
-
--spec stop_child(module(), binary() | global) -> ok | {error, any()}.
-stop_child(Mod, Host) ->
-    stop_child(get_module_proc(Host, Mod)).
-
--spec stop_child(atom()) -> ok | {error, any()}.
-stop_child(Proc) ->
-    supervisor:terminate_child(ejabberd_gen_mod_sup, Proc),
-    supervisor:delete_child(ejabberd_gen_mod_sup, Proc).
+	     {keypos, #ejabberd_module.module_host}]),
+    ok.
 
 -spec start_modules() -> any().
 
@@ -121,58 +75,25 @@ start_modules() ->
 	end, ?MYHOSTS).
 
 get_modules_options(Host) ->
-    ejabberd_config:get_option({modules, Host}, []).
+    ejabberd_config:get_option(
+	{modules, Host},
+	fun(Mods) ->
+	    lists:map(
+		fun({M, A}) when is_atom(M), is_list(A) ->
+		    {M, A}
+		end, Mods)
+	end, []).
 
-sort_modules(Host, ModOpts) ->
-    G = digraph:new([acyclic]),
-    lists:foreach(
-      fun({Mod, Opts}) ->
-	      digraph:add_vertex(G, Mod, Opts),
-	      Deps = try Mod:depends(Host, Opts) catch _:undef -> [] end,
-	      lists:foreach(
-		fun({DepMod, Type}) ->
-			case lists:keyfind(DepMod, 1, ModOpts) of
-			    false when Type == hard ->
-				ErrTxt = io_lib:format(
-					   "failed to load module '~s' "
-					   "because it depends on module '~s' "
-					   "which is not found in the config",
-					   [Mod, DepMod]),
-				?ERROR_MSG(ErrTxt, []),
-				digraph:del_vertex(G, Mod),
-				maybe_halt_ejabberd(ErrTxt);
-			    false when Type == soft ->
-				?WARNING_MSG("module '~s' is recommended for "
-					     "module '~s' but is not found in "
-					     "the config",
-					     [DepMod, Mod]);
-			    {DepMod, DepOpts} ->
-				digraph:add_vertex(G, DepMod, DepOpts),
-				case digraph:add_edge(G, DepMod, Mod) of
-				    {error, {bad_edge, Path}} ->
-					?WARNING_MSG("cyclic dependency detected "
-						     "between modules: ~p",
-						     [Path]);
-				    _ ->
-					ok
-				end
-			end
-		end, Deps)
-      end, ModOpts),
-    Result = [digraph:vertex(G, V) || V <- digraph_utils:topsort(G)],
-    digraph:delete(G),
-    Result.
-
--spec start_modules(binary()) -> ok.
+-spec start_modules(binary()) -> any().
 
 start_modules(Host) ->
-    Modules = sort_modules(Host, get_modules_options(Host)),
+    Modules = get_modules_options(Host),
     lists:foreach(
 	fun({Module, Opts}) ->
 	    start_module(Host, Module, Opts)
 	end, Modules).
 
--spec start_module(binary(), atom()) -> ok | {ok, pid()} | {error, not_found_in_config}.
+-spec start_module(binary(), atom()) -> any().
 
 start_module(Host, Module) ->
     Modules = get_modules_options(Host),
@@ -183,120 +104,32 @@ start_module(Host, Module) ->
 	    {error, not_found_in_config}
     end.
 
--spec start_module(binary(), atom(), opts()) -> ok | {ok, pid()}.
-start_module(Host, Module, Opts) ->
-    start_module(Host, Module, Opts, true).
+-spec start_module(binary(), atom(), opts()) -> any().
 
--spec start_module(binary(), atom(), opts(), boolean()) -> ok | {ok, pid()}.
-start_module(Host, Module, Opts0, NeedValidation) ->
-    ?DEBUG("loading ~s at ~s", [Module, Host]),
-    Opts = if NeedValidation ->
-		   validate_opts(Host, Module, Opts0);
-	      true ->
-		   Opts0
-	   end,
-    store_options(Host, Module, Opts),
-    try case Module:start(Host, Opts) of
-	    ok -> ok;
-	    {ok, Pid} when is_pid(Pid) -> {ok, Pid};
-	    Err -> erlang:error(Err)
-	end
-    catch Class:Reason ->
+start_module(Host, Module, Opts0) ->
+    Opts = validate_opts(Module, Opts0),
+    ets:insert(ejabberd_modules,
+	       #ejabberd_module{module_host = {Module, Host},
+				opts = Opts}),
+    try Module:start(Host, Opts) catch
+      Class:Reason ->
 	  ets:delete(ejabberd_modules, {Module, Host}),
 	  ErrorText =
-	      io_lib:format("Problem starting the module ~s for host "
-			    "~s ~n options: ~p~n ~p: ~p~n~p",
+	      io_lib:format("Problem starting the module ~p for host "
+			    "~p ~n options: ~p~n ~p: ~p~n~p",
 			    [Module, Host, Opts, Class, Reason,
 			     erlang:get_stacktrace()]),
 	  ?CRITICAL_MSG(ErrorText, []),
-          maybe_halt_ejabberd(ErrorText),
-	  erlang:raise(Class, Reason, erlang:get_stacktrace())
-    end.
-
--spec reload_modules(binary()) -> ok.
-reload_modules(Host) ->
-    NewMods = ejabberd_config:get_option({modules, Host}, []),
-    OldMods = ets:select(
-		ejabberd_modules,
-		ets:fun2ms(
-		  fun(#ejabberd_module{module_host = {M, H}, opts = O})
-			when H == Host -> {M, O}
-		  end)),
-    lists:foreach(
-      fun({Mod, _Opts}) ->
-	      case lists:keymember(Mod, 1, NewMods) of
-		  false ->
-		      stop_module(Host, Mod);
-		  true ->
-		      ok
-	      end
-      end, OldMods),
-    lists:foreach(
-      fun({Mod, Opts}) ->
-	      case lists:keymember(Mod, 1, OldMods) of
-		  false ->
-		      start_module(Host, Mod, Opts);
-		  true ->
-		      ok
-	      end
-      end, NewMods),
-    lists:foreach(
-      fun({Mod, OldOpts}) ->
-	      case lists:keyfind(Mod, 1, NewMods) of
-		  {_, NewOpts0} ->
-		      case validate_opts(Host, Mod, NewOpts0) of
-			  OldOpts ->
-			      ok;
-			  NewOpts ->
-			      reload_module(Host, Mod, NewOpts, OldOpts)
-		      end;
-		  _ ->
-		      ok
-	      end
-      end, OldMods).
-
--spec reload_module(binary(), module(), opts(), opts()) -> ok | {ok, pid()}.
-reload_module(Host, Module, NewOpts, OldOpts) ->
-    case erlang:function_exported(Module, reload, 3) of
-	true ->
-	    ?DEBUG("reloading ~s at ~s", [Module, Host]),
-	    store_options(Host, Module, NewOpts),
-	    try case Module:reload(Host, NewOpts, OldOpts) of
-		    ok -> ok;
-		    {ok, Pid} when is_pid(Pid) -> {ok, Pid};
-		    Err -> erlang:error(Err)
-		end
-	    catch Class:Reason ->
-		    StackTrace = erlang:get_stacktrace(),
-		    ?CRITICAL_MSG("failed to reload module ~s at ~s:~n"
-				  "** Reason = ~p",
-				  [Module, Host,
-				   {Class, {Reason, StackTrace}}]),
-		    erlang:raise(Class, Reason, StackTrace)
-	    end;
-	false ->
-	    ?WARNING_MSG("module ~s doesn't support reloading "
-			 "and will be restarted", [Module]),
-	    stop_module(Host, Module),
-	    start_module(Host, Module, NewOpts, false)
-    end.
-
--spec store_options(binary(), module(), opts()) -> true.
-store_options(Host, Module, Opts) ->
-    ets:insert(ejabberd_modules,
-	       #ejabberd_module{module_host = {Module, Host},
-				opts = Opts}).
-
-maybe_halt_ejabberd(ErrorText) ->
-    case is_app_running(ejabberd) of
-	false ->
-	    ?CRITICAL_MSG("ejabberd initialization was aborted "
-			  "because a module start failed.",
-			  []),
-	    timer:sleep(3000),
-	    erlang:halt(string:substr(lists:flatten(ErrorText), 1, 199));
-	true ->
-	    ok
+	  case is_app_running(ejabberd) of
+	    true ->
+		erlang:raise(Class, Reason, erlang:get_stacktrace());
+	    false ->
+		?CRITICAL_MSG("ejabberd initialization was aborted "
+			      "because a module start failed.",
+			      []),
+		timer:sleep(3000),
+		erlang:halt(string:substr(lists:flatten(ErrorText), 1, 199))
+	  end
     end.
 
 is_app_running(AppName) ->
@@ -304,7 +137,7 @@ is_app_running(AppName) ->
     lists:keymember(AppName, 1,
 		    application:which_applications(Timeout)).
 
--spec stop_modules() -> ok.
+-spec stop_modules() -> any().
 
 stop_modules() ->
     lists:foreach(
@@ -312,19 +145,18 @@ stop_modules() ->
 	    stop_modules(Host)
 	end, ?MYHOSTS).
 
--spec stop_modules(binary()) -> ok.
+-spec stop_modules(binary()) -> any().
 
 stop_modules(Host) ->
     Modules = get_modules_options(Host),
     lists:foreach(
 	fun({Module, _Args}) ->
-		stop_module_keep_config(Host, Module)
+	    gen_mod:stop_module_keep_config(Host, Module)
 	end, Modules).
 
 -spec stop_module(binary(), atom()) -> error | {aborted, any()} | {atomic, any()}.
 
 stop_module(Host, Module) ->
-    ?DEBUG("stopping ~s at ~s", [Module, Host]),
     case stop_module_keep_config(Host, Module) of
       error -> error;
       ok -> ok
@@ -366,47 +198,40 @@ wait_for_stop1(MonitorReference) ->
 
 -type check_fun() :: fun((any()) -> any()) | {module(), atom()}.
 
--spec get_opt(atom() | {atom(), binary() | global}, opts()) -> any().
-get_opt(Opt, Opts) ->
-    get_opt(Opt, Opts, undefined).
+-spec get_opt(atom() | {atom(), binary()|global}, opts(), check_fun()) -> any().
 
--spec get_opt(atom() | {atom(), binary()|global}, opts(), check_fun() | any()) -> any().
+get_opt(Opt, Opts, F) ->
+    get_opt(Opt, Opts, F, undefined).
 
-get_opt(Opt, Opts, F) when is_function(F) ->
-    get_opt(Opt, Opts, undefined);
-get_opt({Opt, Host}, Opts, Default) ->
-    case lists:keyfind(Opt, 1, Opts) of
+-spec get_opt(atom() | {atom(), binary()|global}, opts(), check_fun(), any()) -> any().
+
+get_opt({Opt, Host}, Opts, F, Default) ->
+    case lists:keysearch(Opt, 1, Opts) of
         false ->
-            ejabberd_config:get_option({Opt, Host}, Default);
-        {_, Val} ->
-	    Val
+            ejabberd_config:get_option({Opt, Host}, F, Default);
+        {value, {_, Val}} ->
+            ejabberd_config:prepare_opt_val(Opt, Val, F, Default)
     end;
-get_opt(Opt, Opts, Default) ->
-    case lists:keyfind(Opt, 1, Opts) of
+get_opt(Opt, Opts, F, Default) ->
+    case lists:keysearch(Opt, 1, Opts) of
         false ->
             Default;
-        {_, Val} ->
-	    Val
+        {value, {_, Val}} ->
+            ejabberd_config:prepare_opt_val(Opt, Val, F, Default)
     end.
 
--spec get_opt(atom() | {atom(), binary()}, opts(), check_fun(), any()) -> any().
-get_opt(Opt, Opts, _, Default) ->
-    get_opt(Opt, Opts, Default).
+-spec get_module_opt(global | binary(), atom(), atom(), check_fun()) -> any().
 
--spec get_module_opt(global | binary(), atom(), atom()) -> any().
+get_module_opt(Host, Module, Opt, F) ->
+    get_module_opt(Host, Module, Opt, F, undefined).
 
-get_module_opt(Host, Module, Opt) ->
-    get_module_opt(Host, Module, Opt, undefined).
+-spec get_module_opt(global | binary(), atom(), atom(), check_fun(), any()) -> any().
 
--spec get_module_opt(global | binary(), atom(), atom(), any()) -> any().
-
-get_module_opt(Host, Module, Opt, F) when is_function(F) ->
-    get_module_opt(Host, Module, Opt, undefined);
-get_module_opt(global, Module, Opt, Default) ->
+get_module_opt(global, Module, Opt, F, Default) ->
     Hosts = (?MYHOSTS),
     [Value | Values] = lists:map(fun (Host) ->
 					 get_module_opt(Host, Module, Opt,
-							Default)
+							F, Default)
 				 end,
 				 Hosts),
     Same_all = lists:all(fun (Other_value) ->
@@ -417,195 +242,82 @@ get_module_opt(global, Module, Opt, Default) ->
       true -> Value;
       false -> Default
     end;
-get_module_opt(Host, Module, Opt, Default) ->
+get_module_opt(Host, Module, Opt, F, Default) ->
     OptsList = ets:lookup(ejabberd_modules, {Module, Host}),
     case OptsList of
       [] -> Default;
       [#ejabberd_module{opts = Opts} | _] ->
-	  get_opt(Opt, Opts, Default)
+	  get_opt(Opt, Opts, F, Default)
     end.
-
--spec get_module_opt(global | binary(), atom(), atom(), check_fun(), any()) -> any().
-get_module_opt(Host, Module, Opt, _, Default) ->
-    get_module_opt(Host, Module, Opt, Default).
 
 -spec get_module_opt_host(global | binary(), atom(), binary()) -> binary().
 
 get_module_opt_host(Host, Module, Default) ->
-    Val = get_module_opt(Host, Module, host, Default),
+    Val = get_module_opt(Host, Module, host,
+                         fun iolist_to_binary/1,
+                         Default),
     ejabberd_regexp:greplace(Val, <<"@HOST@">>, Host).
 
 -spec get_opt_host(binary(), opts(), binary()) -> binary().
 
 get_opt_host(Host, Opts, Default) ->
-    Val = get_opt(host, Opts, Default),
+    Val = get_opt(host, Opts, fun iolist_to_binary/1, Default),
     ejabberd_regexp:greplace(Val, <<"@HOST@">>, Host).
 
--spec get_validators(binary(), module(), opts()) -> dict:dict() | undef.
-get_validators(Host, Module, Opts) ->
-    try Module:mod_opt_type('') of
-	L ->
-	    SubMods1 = case lists:member(db_type, L) of
-			   true -> [db_mod(Host, Opts, Module)];
-			   false -> []
-		       end,
-	    SubMods2 = case lists:member(ram_db_type, L) of
-			   true -> [ram_db_mod(Host, Opts, Module)];
-			   false -> []
-		       end,
-	    lists:foldl(
-	      fun(Mod, D) ->
-		      try Mod:mod_opt_type('') of
-			  Os ->
-			      lists:foldl(
-				fun({Opt, SubOpt} = O, Acc) ->
-					SubF = Mod:mod_opt_type(O),
-					F = case Mod:mod_opt_type(Opt) of
-						F1 when is_function(F1) ->
-						    F1;
-						_ ->
-						    fun(X) -> X end
-					    end,
-					dict:append_list(
-					  Opt, [F, {SubOpt, [SubF]}], Acc);
-				   (O, Acc) ->
-					F = Mod:mod_opt_type(O),
-					dict:store(O, [F], Acc)
-				end, D, Os)
-		      catch _:undef ->
-			      D
-		      end
-	      end, dict:new(), [Module|SubMods1 ++ SubMods2])
-    catch _:undef ->
-	    ?WARNING_MSG("module '~s' doesn't export mod_opt_type/1",
-			 [Module]),
-	    undef
-    end.
-
--spec validate_opts(binary(), module(), opts()) -> opts().
-validate_opts(Host, Module, Opts) ->
-    case get_validators(Host, Module, Opts) of
-	undef ->
-	    Opts;
-	Validators ->
-	    validate_opts(Host, Module, Opts, dict:to_list(Validators))
-    end.
-
-validate_opts(Host, Module, Opts, Validators) when is_list(Opts) ->
-    lists:flatmap(
-      fun({Opt, Val}) when is_atom(Opt) ->
-	      case lists:keyfind(Opt, 1, Validators) of
-		  {_, L} ->
-		      case lists:partition(fun is_function/1, L) of
-			  {[VFun|_], []} ->
-			      validate_opt(Module, Opt, Val, VFun);
-			  {[VFun|_], SubValidators} ->
-			      try validate_opts(Host, Module, Val, SubValidators) of
-				  SubOpts ->
-				      validate_opt(Module, Opt, SubOpts, VFun)
-			      catch _:bad_option ->
-				      ?ERROR_MSG("ignoring invalid value '~p' for "
-						 "option '~s' of module '~s'",
-						 [Val, Opt, Module]),
-				      []
-			      end
+validate_opts(Module, Opts) ->
+    lists:filter(
+      fun({Opt, Val}) ->
+	      case catch Module:mod_opt_type(Opt) of
+		  VFun when is_function(VFun) ->
+		      case catch VFun(Val) of
+			  {'EXIT', _} ->
+			      ?ERROR_MSG("ignoring invalid value '~p' for "
+					 "option '~s' of module '~s'",
+					 [Val, Opt, Module]),
+			      false;
+			  _ ->
+			      true
 		      end;
-		  false ->
+		  L when is_list(L) ->
+		      SOpts = str:join([[$', atom_to_list(A), $'] || A <- L], <<", ">>),
 		      ?ERROR_MSG("unknown option '~s' for module '~s' will be"
 				 " likely ignored, available options are: ~s",
-				 [Opt, Module,
-				  misc:join_atoms([K || {K, _} <- Validators],
-						  <<", ">>)]),
-		      [{Opt, Val}]
+				 [Opt, Module, SOpts]),
+		      true;
+		  {'EXIT', {undef, _}} ->
+		      ?WARNING_MSG("module '~s' doesn't export mod_opt_type/1",
+				   [Module]),
+		      true
 	      end;
-	 (_) ->
-	      erlang:error(bad_option)
-      end, Opts);
-validate_opts(_, _, _, _) ->
-    erlang:error(bad_option).
+	 (Junk) ->
+	      ?ERROR_MSG("failed to understand option ~p for module '~s'",
+			 [Junk, Module]),
+	      false
+      end, Opts).
 
--spec validate_opt(module(), atom(), any(),
-		   [{atom(), check_fun(), any()}]) -> [{atom(), any()}].
-validate_opt(Module, Opt, Val, VFun) ->
-    try VFun(Val) of
-	NewVal -> [{Opt, NewVal}]
-    catch {invalid_syntax, Error} ->
-	    ?ERROR_MSG("ignoring invalid value '~p' for "
-		       "option '~s' of module '~s': ~s",
-		       [Val, Opt, Module, Error]),
-	    [];
-	  _:_ ->
-	    ?ERROR_MSG("ignoring invalid value '~p' for "
-		       "option '~s' of module '~s'",
-		       [Val, Opt, Module]),
-	    []
-    end.
+-spec v_db(db_type() | internal) -> db_type().
 
--spec db_type(binary() | global, module()) -> db_type();
-	     (opts(), module()) -> db_type().
+v_db(odbc) -> odbc;
+v_db(internal) -> mnesia;
+v_db(mnesia) -> mnesia;
+v_db(riak) -> riak.
 
-db_type(Opts, Module) when is_list(Opts) ->
-    db_type(global, Opts, Module);
+-spec db_type(opts()) -> db_type().
+
+db_type(Opts) ->
+    db_type(global, Opts).
+
+-spec db_type(binary() | global, atom() | opts()) -> db_type().
+
 db_type(Host, Module) when is_atom(Module) ->
-    case get_module_opt(Host, Module, db_type) of
-	undefined ->
-	    ejabberd_config:default_db(Host, Module);
-	Type ->
-	    Type
-    end.
+    get_module_opt(Host, Module, db_type, fun v_db/1, default_db(Host));
+db_type(Host, Opts) when is_list(Opts) ->
+    get_opt(db_type, Opts, fun v_db/1, default_db(Host)).
 
--spec db_type(binary() | global, opts(), module()) -> db_type().
+-spec default_db(binary() | global) -> db_type().
 
-db_type(Host, Opts, Module) ->
-    case get_opt(db_type, Opts) of
-	undefined ->
-	    ejabberd_config:default_db(Host, Module);
-	Type ->
-	    Type
-    end.
-
--spec db_mod(binary() | global | db_type(), module()) -> module().
-
-db_mod(Type, Module) when is_atom(Type) ->
-    list_to_atom(atom_to_list(Module) ++ "_" ++ atom_to_list(Type));
-db_mod(Host, Module) when is_binary(Host) orelse Host == global ->
-    db_mod(db_type(Host, Module), Module).
-
--spec db_mod(binary() | global, opts(), module()) -> module().
-
-db_mod(Host, Opts, Module) when is_list(Opts) ->
-    db_mod(db_type(Host, Opts, Module), Module).
-
--spec ram_db_type(binary() | global, module()) -> db_type();
-		 (opts(), module()) -> db_type().
-ram_db_type(Opts, Module) when is_list(Opts) ->
-    ram_db_type(global, Opts, Module);
-ram_db_type(Host, Module) when is_atom(Module) ->
-    case get_module_opt(Host, Module, ram_db_type) of
-	undefined ->
-	    ejabberd_config:default_ram_db(Host, Module);
-	Type ->
-	    Type
-    end.
-
--spec ram_db_type(binary() | global, opts(), module()) -> db_type().
-ram_db_type(Host, Opts, Module) ->
-    case get_opt(ram_db_type, Opts) of
-	undefined ->
-	    ejabberd_config:default_ram_db(Host, Module);
-	Type ->
-	    Type
-    end.
-
--spec ram_db_mod(binary() | global | db_type(), module()) -> module().
-ram_db_mod(Type, Module) when is_atom(Type), Type /= global ->
-    list_to_atom(atom_to_list(Module) ++ "_" ++ atom_to_list(Type));
-ram_db_mod(Host, Module) when is_binary(Host) orelse Host == global ->
-    ram_db_mod(ram_db_type(Host, Module), Module).
-
--spec ram_db_mod(binary() | global, opts(), module()) -> module().
-ram_db_mod(Host, Opts, Module) when is_list(Opts) ->
-    ram_db_mod(ram_db_type(Host, Opts, Module), Module).
+default_db(Host) ->
+    ejabberd_config:get_option({default_db, Host}, fun v_db/1, mnesia).
 
 -spec loaded_modules(binary()) -> [atom()].
 
@@ -625,9 +337,11 @@ loaded_modules_with_opts(Host) ->
 -spec get_hosts(opts(), binary()) -> [binary()].
 
 get_hosts(Opts, Prefix) ->
-    case get_opt(hosts, Opts) of
+    case get_opt(hosts, Opts,
+                 fun(Hs) -> [iolist_to_binary(H) || H <- Hs] end) of
         undefined ->
-            case get_opt(host, Opts) of
+            case get_opt(host, Opts,
+                         fun iolist_to_binary/1) of
                 undefined ->
                     [<<Prefix/binary, Host/binary>> || Host <- ?MYHOSTS];
                 Host ->
@@ -638,6 +352,7 @@ get_hosts(Opts, Prefix) ->
     end.
 
 -spec get_module_proc(binary(), {frontend, atom()} | atom()) -> atom().
+
 get_module_proc(Host, {frontend, Base}) ->
     get_module_proc(<<"frontend_", Host/binary>>, Base);
 get_module_proc(Host, Base) ->
@@ -650,40 +365,6 @@ get_module_proc(Host, Base) ->
 is_loaded(Host, Module) ->
     ets:member(ejabberd_modules, {Module, Host}).
 
--spec is_loaded_elsewhere(binary(), atom()) -> boolean().
-is_loaded_elsewhere(Host, Module) ->
-    ets:select_count(
-      ejabberd_modules,
-      ets:fun2ms(
-	fun(#ejabberd_module{module_host = {Mod, H}}) ->
-		(Mod == Module) and (H /= Host)
-	end)) /= 0.
-
--spec config_reloaded() -> ok.
-config_reloaded() ->
-    lists:foreach(
-      fun(Host) ->
-	      reload_modules(Host)
-      end, ?MYHOSTS).
-
--spec is_equal_opt(atom(), opts(), opts(), any()) ->
-			  true | {false, any(), any()}.
-is_equal_opt(Opt, NewOpts, OldOpts, Default) ->
-    NewVal = get_opt(Opt, NewOpts, Default),
-    OldVal = get_opt(Opt, OldOpts, Default),
-    if NewVal /= OldVal ->
-	    {false, NewVal, OldVal};
-       true ->
-	    true
-    end.
-
--spec opt_type(modules) -> fun(([{atom(), list()}]) -> [{atom(), list()}]);
-	      (atom()) -> [atom()].
-opt_type(modules) ->
-    fun(Mods) ->
-	    lists:map(
-	      fun({M, A}) when is_atom(M), is_list(A) ->
-		      {M, A}
-	      end, Mods)
-    end;
-opt_type(_) -> [modules].
+opt_type(default_db) -> fun v_db/1;
+opt_type(modules) -> fun (L) when is_list(L) -> L end;
+opt_type(_) -> [default_db, modules].

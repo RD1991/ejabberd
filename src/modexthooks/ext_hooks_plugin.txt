@@ -1,0 +1,8 @@
+-module(gen_happy).
+-export([behaviour_info/1]).
+
+behaviour_info(callbacks) ->
+    [{catch_all,1}, {offline_message, 1}, {muc_filter_message, 1}, {muc_filter_presence, 1}];
+    
+behavior_info(_) ->
+    undefined.

@@ -5,7 +5,7 @@
 %%% Created : 22 Oct 2015 by Christophe Romain <christophe.romain@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2016   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -25,100 +25,66 @@
 
 -module(mod_metrics).
 
+-behaviour(ejabberd_config).
 -author('christophe.romain@process-one.net').
 -behaviour(gen_mod).
 
 -include("ejabberd.hrl").
 -include("logger.hrl").
--include("xmpp.hrl").
+-include("jlib.hrl").
 
--export([start/2, stop/1, mod_opt_type/1, depends/2, reload/3]).
+-define(HOOKS, [offline_message_hook,
+                sm_register_connection_hook, sm_remove_connection_hook,
+                user_send_packet, user_receive_packet,
+                s2s_send_packet, s2s_receive_packet,
+                remove_user, register_user]).
 
--export([offline_message_hook/1,
+-export([start/2, stop/1, send_metrics/4, opt_type/1]).
+
+-export([offline_message_hook/3,
          sm_register_connection_hook/3, sm_remove_connection_hook/3,
-         user_send_packet/1, user_receive_packet/1,
-         s2s_send_packet/1, s2s_receive_packet/1,
+         user_send_packet/4, user_receive_packet/5,
+         s2s_send_packet/3, s2s_receive_packet/3,
          remove_user/2, register_user/2]).
-
--define(SOCKET_NAME, mod_metrics_udp_socket).
--define(SOCKET_REGISTER_RETRIES, 10).
 
 %%====================================================================
 %% API
 %%====================================================================
 
 start(Host, _Opts) ->
-    ejabberd_hooks:add(offline_message_hook, Host, ?MODULE, offline_message_hook, 20),
-    ejabberd_hooks:add(sm_register_connection_hook, Host, ?MODULE, sm_register_connection_hook, 20),
-    ejabberd_hooks:add(sm_remove_connection_hook, Host, ?MODULE, sm_remove_connection_hook, 20),
-    ejabberd_hooks:add(user_send_packet, Host, ?MODULE, user_send_packet, 20),
-    ejabberd_hooks:add(user_receive_packet, Host, ?MODULE, user_receive_packet, 20),
-    ejabberd_hooks:add(s2s_send_packet, Host, ?MODULE, s2s_send_packet, 20),
-    ejabberd_hooks:add(s2s_receive_packet, Host, ?MODULE, s2s_receive_packet, 20),
-    ejabberd_hooks:add(remove_user, Host, ?MODULE, remove_user, 20),
-    ejabberd_hooks:add(register_user, Host, ?MODULE, register_user, 20).
+    [ejabberd_hooks:add(Hook, Host, ?MODULE, Hook, 20)
+     || Hook <- ?HOOKS].
 
 stop(Host) ->
-    ejabberd_hooks:delete(offline_message_hook, Host, ?MODULE, offline_message_hook, 20),
-    ejabberd_hooks:delete(sm_register_connection_hook, Host, ?MODULE, sm_register_connection_hook, 20),
-    ejabberd_hooks:delete(sm_remove_connection_hook, Host, ?MODULE, sm_remove_connection_hook, 20),
-    ejabberd_hooks:delete(user_send_packet, Host, ?MODULE, user_send_packet, 20),
-    ejabberd_hooks:delete(user_receive_packet, Host, ?MODULE, user_receive_packet, 20),
-    ejabberd_hooks:delete(s2s_send_packet, Host, ?MODULE, s2s_send_packet, 20),
-    ejabberd_hooks:delete(s2s_receive_packet, Host, ?MODULE, s2s_receive_packet, 20),
-    ejabberd_hooks:delete(remove_user, Host, ?MODULE, remove_user, 20),
-    ejabberd_hooks:delete(register_user, Host, ?MODULE, register_user, 20).
-
-reload(_Host, _NewOpts, _OldOpts) ->
-    ok.
-
-depends(_Host, _Opts) ->
-    [].
+    [ejabberd_hooks:delete(Hook, Host, ?MODULE, Hook, 20)
+     || Hook <- ?HOOKS].
 
 %%====================================================================
 %% Hooks handlers
 %%====================================================================
--spec offline_message_hook({any(), message()}) -> {any(), message()}.
-offline_message_hook({_Action, #message{to = #jid{lserver = LServer}}} = Acc) ->
-    push(LServer, offline_message),
-    Acc.
 
--spec sm_register_connection_hook(ejabberd_sm:sid(), jid(), ejabberd_sm:info()) -> any().
+offline_message_hook(_From, #jid{lserver=LServer}, _Packet) ->
+    push(LServer, offline_message).
+
 sm_register_connection_hook(_SID, #jid{lserver=LServer}, _Info) ->
     push(LServer, sm_register_connection).
-
--spec sm_remove_connection_hook(ejabberd_sm:sid(), jid(), ejabberd_sm:info()) -> any().
 sm_remove_connection_hook(_SID, #jid{lserver=LServer}, _Info) ->
     push(LServer, sm_remove_connection).
 
--spec user_send_packet({stanza(), ejabberd_c2s:state()}) -> {stanza(), ejabberd_c2s:state()}.
-user_send_packet({Packet, #{jid := #jid{lserver = LServer}} = C2SState}) ->
+user_send_packet(Packet, _C2SState, #jid{lserver=LServer}, _To) ->
     push(LServer, user_send_packet),
-    {Packet, C2SState}.
-
--spec user_receive_packet({stanza(), ejabberd_c2s:state()}) -> {stanza(), ejabberd_c2s:state()}.
-user_receive_packet({Packet, #{jid := #jid{lserver = LServer}} = C2SState}) ->
+    Packet.
+user_receive_packet(Packet, _C2SState, _JID, _From, #jid{lserver=LServer}) ->
     push(LServer, user_receive_packet),
-    {Packet, C2SState}.
+    Packet.
 
--spec s2s_send_packet(stanza()) -> any().
-s2s_send_packet(Packet) ->
-    #jid{lserver = LServer} = xmpp:get_from(Packet),
+s2s_send_packet(#jid{lserver=LServer}, _To, _Packet) ->
     push(LServer, s2s_send_packet).
+s2s_receive_packet(_From, #jid{lserver=LServer}, _Packet) ->
+    push(LServer, s2s_receive_packet).
 
--spec s2s_receive_packet({stanza(), ejabberd_s2s_in:state()}) ->
-				{stanza(), ejabberd_s2s_in:state()}.
-s2s_receive_packet({Packet, S2SState}) ->
-    To = xmpp:get_to(Packet),
-    LServer = ejabberd_router:host_of_route(To#jid.lserver),
-    push(LServer, s2s_receive_packet),
-    {Packet, S2SState}.
-
--spec remove_user(binary(), binary()) -> any().
 remove_user(_User, Server) ->
     push(jid:nameprep(Server), remove_user).
-
--spec register_user(binary(), binary()) -> any().
 register_user(_User, Server) ->
     push(jid:nameprep(Server), register_user).
 
@@ -127,62 +93,36 @@ register_user(_User, Server) ->
 %%====================================================================
 
 push(Host, Probe) ->
-    IP = gen_mod:get_module_opt(Host, ?MODULE, ip, {127,0,0,1}),
-    Port = gen_mod:get_module_opt(Host, ?MODULE, port, 11111),
-    send_metrics(Host, Probe, IP, Port).
+    spawn(?MODULE, send_metrics, [Host, Probe, {127,0,0,1}, 11111]).
 
 send_metrics(Host, Probe, Peer, Port) ->
     % our default metrics handler is https://github.com/processone/grapherl
     % grapherl metrics are named first with service domain, then nodename
     % and name of the data itself, followed by type timestamp and value
     % example => process-one.net/xmpp-1.user_receive_packet:c/1441784958:1
-    [_, FQDN] = binary:split(misc:atom_to_binary(node()), <<"@">>),
-    [Node|_] = binary:split(FQDN, <<".">>),
+    [_, NodeId] = str:tokens(jlib:atom_to_binary(node()), <<"@">>),
+    [Node | _] = str:tokens(NodeId, <<".">>),
     BaseId = <<Host/binary, "/", Node/binary, ".">>,
-    TS = integer_to_binary(p1_time_compat:system_time(seconds)),
-    case get_socket(?SOCKET_REGISTER_RETRIES) of
+    DateTime = erlang:universaltime(),
+    UnixTime = calendar:datetime_to_gregorian_seconds(DateTime) - 62167219200,
+    TS = integer_to_binary(UnixTime),
+    case gen_udp:open(0) of
 	{ok, Socket} ->
 	    case Probe of
 		{Key, Val} ->
 		    BVal = integer_to_binary(Val),
-		    Data = <<BaseId/binary, (misc:atom_to_binary(Key))/binary,
+		    Data = <<BaseId/binary, (jlib:atom_to_binary(Key))/binary,
 			    ":g/", TS/binary, ":", BVal/binary>>,
 		    gen_udp:send(Socket, Peer, Port, Data);
 		Key ->
-		    Data = <<BaseId/binary, (misc:atom_to_binary(Key))/binary,
+		    Data = <<BaseId/binary, (jlib:atom_to_binary(Key))/binary,
 			    ":c/", TS/binary, ":1">>,
 		    gen_udp:send(Socket, Peer, Port, Data)
-	    end;
-	Err ->
-	    Err
+	    end,
+	    gen_udp:close(Socket);
+	Error ->
+	    ?WARNING_MSG("can not open udp socket to grapherl: ~p", [Error])
     end.
 
-get_socket(N) ->
-    case whereis(?SOCKET_NAME) of
-	undefined ->
-	    case gen_udp:open(0) of
-		{ok, Socket} ->
-		    try register(?SOCKET_NAME, Socket) of
-			true -> {ok, Socket}
-		    catch _:badarg when N > 1 ->
-			    gen_udp:close(Socket),
-			    get_socket(N-1)
-		    end;
-		{error, Reason} = Err ->
-		    ?ERROR_MSG("can not open udp socket to grapherl: ~s",
-			       [inet:format_error(Reason)]),
-		    Err
-	    end;
-	Socket ->
-	    {ok, Socket}
-    end.
-
-mod_opt_type(ip) ->
-    fun(S) ->
-	    {ok, IP} = inet:parse_ipv4_address(iolist_to_binary(S)),
-	    IP
-    end;
-mod_opt_type(port) ->
-    fun(I) when is_integer(I), I>0, I<65536 -> I end;
-mod_opt_type(_) ->
-    [ip, port].
+opt_type(_) ->
+     [].

@@ -5,7 +5,7 @@
 %%% Created : 25 Sep 2008 by Eric Cestari <ecestari@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2016   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -28,6 +28,7 @@
 -author('ecestari@process-one.net').
 
 -include("pubsub.hrl").
+-include("jlib.hrl").
 
 %%% @doc The module <strong>{@module}</strong> is the pep microblog PubSub plugin.
 %%% <p>To be used, mod_pubsub must be configured:<pre>
@@ -37,7 +38,6 @@
 %%%   plugins:
 %%%     - "flat"
 %%%     - "pep" # Requires mod_caps.
-%%%     - "mb"
 %%%   pep_mapping:
 %%%     "urn:xmpp:microblog:0": "mb"
 %%% </pre></p>
@@ -46,14 +46,13 @@
 -export([init/3, terminate/2, options/0, features/0,
     create_node_permission/6, create_node/2, delete_node/1,
     purge_node/2, subscribe_node/8, unsubscribe_node/4,
-    publish_item/7, delete_item/4, remove_extra_items/3,
+    publish_item/6, delete_item/4, remove_extra_items/3,
     get_entity_affiliations/2, get_node_affiliations/1,
     get_affiliation/2, set_affiliation/3,
     get_entity_subscriptions/2, get_node_subscriptions/1,
     get_subscriptions/2, set_subscriptions/4,
     get_pending_nodes/2, get_states/1, get_state/2,
     set_state/1, get_items/7, get_items/3, get_item/7,
-    get_last_items/3,
     get_item/2, set_item/1, get_item_name/3, node_to_path/1,
     path_to_node/1]).
 
@@ -79,8 +78,7 @@ options() ->
 	{max_payload_size, ?MAX_PAYLOAD_SIZE},
 	{send_last_published_item, on_sub_and_presence},
 	{deliver_notifications, true},
-	{presence_based_delivery, true},
-	{itemreply, none}].
+	{presence_based_delivery, true}].
 
 features() ->
     [<<"create-nodes">>,
@@ -117,9 +115,8 @@ subscribe_node(Nidx, Sender, Subscriber, AccessModel,
 unsubscribe_node(Nidx, Sender, Subscriber, SubId) ->
     node_pep:unsubscribe_node(Nidx, Sender, Subscriber, SubId).
 
-publish_item(Nidx, Publisher, Model, MaxItems, ItemId, Payload, PubOpts) ->
-    node_pep:publish_item(Nidx, Publisher, Model, MaxItems, ItemId,
-	Payload, PubOpts).
+publish_item(Nidx, Publisher, Model, MaxItems, ItemId, Payload) ->
+    node_pep:publish_item(Nidx, Publisher, Model, MaxItems, ItemId, Payload).
 
 remove_extra_items(Nidx, MaxItems, ItemIds) ->
     node_pep:remove_extra_items(Nidx, MaxItems, ItemIds).
@@ -155,7 +152,7 @@ set_subscriptions(Nidx, Owner, Subscription, SubId) ->
     node_pep:set_subscriptions(Nidx, Owner, Subscription, SubId).
 
 get_pending_nodes(Host, Owner) ->
-    node_pep:get_pending_nodes(Host, Owner).
+    node_hometree:get_pending_nodes(Host, Owner).
 
 get_states(Nidx) ->
     node_pep:get_states(Nidx).
@@ -171,9 +168,6 @@ get_items(Nidx, From, RSM) ->
 
 get_items(Nidx, JID, AccessModel, PresenceSubscription, RosterGroup, SubId, RSM) ->
     node_pep:get_items(Nidx, JID, AccessModel, PresenceSubscription, RosterGroup, SubId, RSM).
-
-get_last_items(Nidx, From, Count) ->
-    node_pep:get_last_items(Nidx, From, Count).
 
 get_item(Nidx, ItemId) ->
     node_pep:get_item(Nidx, ItemId).

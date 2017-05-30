@@ -5,7 +5,7 @@
 %%% Created : 09-10-2010 by Eric Cestari <ecestari@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2016   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -39,7 +39,7 @@
 -include("ejabberd.hrl").
 -include("logger.hrl").
 
--include("xmpp.hrl").
+-include("jlib.hrl").
 
 -include("ejabberd_http.hrl").
 
@@ -50,12 +50,12 @@
         {socket                       :: ws_socket(),
          ping_interval = ?PING_INTERVAL :: non_neg_integer(),
          ping_timer = make_ref()      :: reference(),
-         pong_expected = false        :: boolean(),
+         pong_expected                :: boolean(),
          timeout = ?WEBSOCKET_TIMEOUT :: non_neg_integer(),
          timer = make_ref()           :: reference(),
          input = []                   :: list(),
          waiting_input = false        :: false | pid(),
-         last_receiver = self()       :: pid(),
+         last_receiver                :: pid(),
          ws                           :: {#ws{}, pid()},
          rfc_compilant = undefined    :: boolean() | undefined}).
 
@@ -112,20 +112,21 @@ socket_handoff(LocalPath, Request, Socket, SockMod, Buf, Opts) ->
 %%% Internal
 
 init([{#ws{ip = IP, http_opts = HOpts}, _} = WS]) ->
-    SOpts = lists:filtermap(fun({stream_management, _}) -> true;
+    SOpts = lists:filtermap(fun({stream_managment, _}) -> true;
                                ({max_ack_queue, _}) -> true;
-                               ({ack_timeout, _}) -> true;
                                ({resume_timeout, _}) -> true;
                                ({max_resume_timeout, _}) -> true;
                                ({resend_on_timeout, _}) -> true;
                                (_) -> false
                             end, HOpts),
-    Opts = ejabberd_c2s_config:get_c2s_limits() ++ SOpts,
+    Opts = [{xml_socket, true} | ejabberd_c2s_config:get_c2s_limits() ++ SOpts],
     PingInterval = ejabberd_config:get_option(
                      {websocket_ping_interval, ?MYNAME},
+                     fun(I) when is_integer(I), I>=0 -> I end,
                      ?PING_INTERVAL) * 1000,
     WSTimeout = ejabberd_config:get_option(
                   {websocket_timeout, ?MYNAME},
+                  fun(I) when is_integer(I), I>0 -> I end,
                   ?WEBSOCKET_TIMEOUT) * 1000,
     Socket = {http_ws, self(), IP},
     ?DEBUG("Client connected through websocket ~p",
@@ -281,7 +282,7 @@ cancel_timer(Timer) ->
     receive {timeout, Timer, _} -> ok after 0 -> ok end.
 
 get_human_html_xmlel() ->
-    Heading = <<"ejabberd ", (misc:atom_to_binary(?MODULE))/binary>>,
+    Heading = <<"ejabberd ", (jlib:atom_to_binary(?MODULE))/binary>>,
     #xmlel{name = <<"html">>,
            attrs =
                [{<<"xmlns">>, <<"http://www.w3.org/1999/xhtml">>}],

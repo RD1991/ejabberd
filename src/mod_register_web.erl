@@ -5,7 +5,7 @@
 %%% Created :  4 May 2008 by Badlop <badlop@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2016   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -55,12 +55,12 @@
 
 -behaviour(gen_mod).
 
--export([start/2, stop/1, reload/3, process/2, mod_opt_type/1, depends/2]).
+-export([start/2, stop/1, process/2, mod_opt_type/1]).
 
 -include("ejabberd.hrl").
 -include("logger.hrl").
 
--include("xmpp.hrl").
+-include("jlib.hrl").
 
 -include("ejabberd_http.hrl").
 
@@ -75,12 +75,6 @@ start(_Host, _Opts) ->
     ok.
 
 stop(_Host) -> ok.
-
-reload(_Host, _NewOpts, _OldOpts) ->
-    ok.
-
-depends(_Host, _Opts) ->
-    [{mod_register, hard}].
 
 %%%----------------------------------------------------------------------
 %%% HTTP handlers
@@ -106,7 +100,7 @@ process([<<"new">>],
 		 lang = Lang, host = _HTTPHost}) ->
     case form_new_post(Q) of
       {success, ok, {Username, Host, _Password}} ->
-	  Jid = jid:make(Username, Host),
+	  Jid = jid:make(Username, Host, <<"">>),
           mod_register:send_registration_notifications(?MODULE, Jid, Ip),
 	  Text = (?T(<<"Your Jabber account was successfully "
 		       "created.">>)),
@@ -337,7 +331,7 @@ build_captcha_li_list2(Lang, IP) ->
     case ejabberd_captcha:create_captcha(SID, From, To,
 					 Lang, IP, Args)
 	of
-      {ok, Id, _, _} ->
+      {ok, Id, _} ->
 	  {_, {CImg, CText, CId, CKey}} =
 	      ejabberd_captcha:build_captcha_html(Id, Lang),
 	  [?XE(<<"li">>,
@@ -438,7 +432,7 @@ change_password(Username, Host, PasswordOld,
     end.
 
 check_account_exists(Username, Host) ->
-    case ejabberd_auth:user_exists(Username, Host) of
+    case ejabberd_auth:is_user_exists(Username, Host) of
       true -> account_exists;
       false -> account_doesnt_exist
     end.
@@ -496,8 +490,10 @@ form_del_get(Host, Lang) ->
 %%                                    {error, not_allowed} |
 %%                                    {error, invalid_jid}
 register_account(Username, Host, Password) ->
-    Access = gen_mod:get_module_opt(Host, mod_register, access, all),
-    case jid:make(Username, Host) of
+    Access = gen_mod:get_module_opt(Host, mod_register, access,
+                                    fun(A) when is_atom(A) -> A end,
+                                    all),
+    case jid:make(Username, Host, <<"">>) of
       error -> {error, invalid_jid};
       JID ->
         case acl:match_rule(Host, Access, JID) of
@@ -510,8 +506,8 @@ register_account2(Username, Host, Password) ->
     case ejabberd_auth:try_register(Username, Host,
 				    Password)
 	of
-      ok ->
-	  {success, ok, {Username, Host, Password}};
+      {atomic, Res} ->
+	  {success, Res, {Username, Host, Password}};
       Other -> Other
     end.
 

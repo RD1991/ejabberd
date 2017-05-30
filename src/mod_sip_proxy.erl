@@ -1,11 +1,12 @@
 %%%-------------------------------------------------------------------
-%%% File    : mod_sip_proxy.erl
-%%% Author  : Evgeny Khramtsov <ekhramtsov@process-one.net>
-%%% Purpose : 
+%%% @author Evgeny Khramtsov <ekhramtsov@process-one.net>
+%%% @doc
+%%%
+%%% @end
 %%% Created : 21 Apr 2014 by Evgeny Khramtsov <ekhramtsov@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2014-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2014-2016   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -24,9 +25,8 @@
 %%%-------------------------------------------------------------------
 -module(mod_sip_proxy).
 
--ifndef(SIP).
--export([]).
--else.
+-behaviour(ejabberd_config).
+
 -define(GEN_FSM, p1_fsm).
 -behaviour(?GEN_FSM).
 
@@ -36,7 +36,7 @@
 -export([init/1, wait_for_request/2,
 	 wait_for_response/2, handle_event/3,
 	 handle_sync_event/4, handle_info/3, terminate/3,
-	 code_change/4]).
+	 code_change/4, opt_type/1]).
 
 -include("ejabberd.hrl").
 -include("logger.hrl").
@@ -49,7 +49,7 @@
 		orig_trid,
 		responses = [] :: [#sip{}],
 		tr_ids = []    :: list(),
-		orig_req = #sip{} :: #sip{}}).
+		orig_req       :: #sip{}}).
 
 %%%===================================================================
 %%% API
@@ -270,7 +270,8 @@ cancel_pending_transactions(State) ->
     lists:foreach(fun esip:cancel/1, State#state.tr_ids).
 
 add_certfile(LServer, Opts) ->
-    case ejabberd_config:get_option({domain_certfile, LServer}) of
+    case ejabberd_config:get_option({domain_certfile, LServer},
+				    fun iolist_to_binary/1) of
 	CertFile when is_binary(CertFile), CertFile /= <<"">> ->
 	    [{certfile, CertFile}|Opts];
 	_ ->
@@ -298,7 +299,7 @@ add_record_route_and_set_uri(URI, LServer, #sip{hdrs = Hdrs} = Req) ->
 	    case need_record_route(LServer) of
 		true ->
 		    RR_URI = get_configured_record_route(LServer),
-		    TS = (integer_to_binary(p1_time_compat:system_time(seconds))),
+		    TS = list_to_binary(integer_to_list(p1_time_compat:system_time(seconds))),
 		    Sign = make_sign(TS, Hdrs),
 		    User = <<TS/binary, $-, Sign/binary>>,
 		    NewRR_URI = RR_URI#uri{user = User},
@@ -316,7 +317,11 @@ is_request_within_dialog(#sip{hdrs = Hdrs}) ->
     esip:has_param(<<"tag">>, Params).
 
 need_record_route(LServer) ->
-    gen_mod:get_module_opt(LServer, mod_sip, always_record_route, true).
+    gen_mod:get_module_opt(
+      LServer, mod_sip, always_record_route,
+      fun(true) -> true;
+	 (false) -> false
+      end, true).
 
 make_sign(TS, Hdrs) ->
     {_, #uri{user = FUser, host = FServer}, FParams} = esip:get_hdr('from', Hdrs),
@@ -327,14 +332,14 @@ make_sign(TS, Hdrs) ->
     LTServer = safe_nameprep(TServer),
     FromTag = esip:get_param(<<"tag">>, FParams),
     CallID = esip:get_hdr('call-id', Hdrs),
-    SharedKey = ejabberd_config:get_option(shared_key),
-    str:sha([SharedKey, LFUser, LFServer, LTUser, LTServer,
+    SharedKey = ejabberd_config:get_option(shared_key, fun(V) -> V end),
+    p1_sha:sha([SharedKey, LFUser, LFServer, LTUser, LTServer,
 		FromTag, CallID, TS]).
 
 is_signed_by_me(TS_Sign, Hdrs) ->
     try
 	[TSBin, Sign] = str:tokens(TS_Sign, <<"-">>),
-	TS = (binary_to_integer(TSBin)),
+	TS = list_to_integer(binary_to_list(TSBin)),
 	NowTS = p1_time_compat:system_time(seconds),
 	true = (NowTS - TS) =< ?SIGN_LIFETIME,
 	Sign == make_sign(TSBin, Hdrs)
@@ -343,17 +348,41 @@ is_signed_by_me(TS_Sign, Hdrs) ->
     end.
 
 get_configured_vias(LServer) ->
-    gen_mod:get_module_opt(LServer, mod_sip, via, []).
+    gen_mod:get_module_opt(
+      LServer, mod_sip, via,
+      fun(L) ->
+	      lists:map(
+		fun(Opts) ->
+			Type = proplists:get_value(type, Opts),
+			Host = proplists:get_value(host, Opts),
+			Port = proplists:get_value(port, Opts),
+			true = (Type == tcp) or (Type == tls) or (Type == udp),
+			true = is_binary(Host) and (Host /= <<"">>),
+			true = (is_integer(Port)
+				and (Port > 0) and (Port < 65536))
+			    or (Port == undefined),
+			{Type, {Host, Port}}
+		end, L)
+      end, []).
 
 get_configured_record_route(LServer) ->
     gen_mod:get_module_opt(
       LServer, mod_sip, record_route,
-      #uri{host = LServer, params = [{<<"lr">>, <<"">>}]}).
+      fun(IOList) ->
+	      S = iolist_to_binary(IOList),
+	      #uri{} = esip:decode_uri(S)
+      end, #uri{host = LServer, params = [{<<"lr">>, <<"">>}]}).
 
 get_configured_routes(LServer) ->
     gen_mod:get_module_opt(
       LServer, mod_sip, routes,
-      [#uri{host = LServer, params = [{<<"lr">>, <<"">>}]}]).
+      fun(L) ->
+	      lists:map(
+		fun(IOList) ->
+			S = iolist_to_binary(IOList),
+			#uri{} = esip:decode_uri(S)
+		end, L)
+      end, [#uri{host = LServer, params = [{<<"lr">>, <<"">>}]}]).
 
 mark_transaction_as_complete(TrID, State) ->
     NewTrIDs = lists:delete(TrID, State#state.tr_ids),
@@ -428,4 +457,6 @@ safe_nameprep(S) ->
 	S1 -> S1
     end.
 
--endif.
+opt_type(domain_certfile) -> fun iolist_to_binary/1;
+opt_type(shared_key) -> fun (V) -> V end;
+opt_type(_) -> [domain_certfile, shared_key].

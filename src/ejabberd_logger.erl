@@ -1,11 +1,11 @@
 %%%-------------------------------------------------------------------
-%%% File    : ejabberd_logger.erl
-%%% Author  : Evgeniy Khramtsov <ekhramtsov@process-one.net>
-%%% Purpose : ejabberd logger wrapper
+%%% @author Evgeniy Khramtsov <ekhramtsov@process-one.net>
+%%% @doc
+%%%
+%%% @end
 %%% Created : 12 May 2013 by Evgeniy Khramtsov <ekhramtsov@process-one.net>
 %%%
-%%%
-%%% ejabberd, Copyright (C) 2013-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2013-2016   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -160,7 +160,7 @@ reopen_log() ->
 
 %% @spec () -> ok
 rotate_log() ->
-    catch lager_crash_log ! rotate,
+    lager_crash_log ! rotate,
     lists:foreach(
       fun({lager_file_backend, File}) ->
               whereis(lager_event) ! {rotate, File};

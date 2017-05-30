@@ -1,11 +1,14 @@
 %%%----------------------------------------------------------------------
 %%% File    : ejabberd_piefxis.erl
-%%% Author  : Pablo Polvorin, Vidal Santiago Martinez, Evgeniy Khramtsov
+%%% Author  : Pablo Polvorin, Vidal Santiago Martinez
 %%% Purpose : XEP-0227: Portable Import/Export Format for XMPP-IM Servers
 %%% Created : 17 Jul 2008 by Pablo Polvorin <pablo.polvorin@process-one.net>
+%%%-------------------------------------------------------------------
+%%% @author Evgeniy Khramtsov <ekhramtsov@process-one.net>
+%%% @doc
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2016   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -25,8 +28,8 @@
 
 %%% Not implemented:
 %%% - write mod_piefxis with ejabberdctl commands
-%%% - Export from mod_offline_sql.erl
-%%% - Export from mod_private_sql.erl
+%%% - Export from mod_offline_odbc.erl
+%%% - Export from mod_private_odbc.erl
 %%% - XEP-227: 6. Security Considerations
 %%% - Other schemas of XInclude are not tested, and may not be imported correctly.
 %%% - If a host has many users, split that host in XML files with 50 users each.
@@ -34,15 +37,18 @@
 
 -module(ejabberd_piefxis).
 
+-behaviour(ejabberd_config).
+
 -protocol({xep, 227, '1.0'}).
 
--export([import_file/1, export_server/1, export_host/2]).
+-export([import_file/1, export_server/1, export_host/2,
+	 opt_type/1]).
 
 -define(CHUNK_SIZE, 1024*20). %20k
 
 -include("ejabberd.hrl").
 -include("logger.hrl").
--include("xmpp.hrl").
+-include("jlib.hrl").
 -include("mod_privacy.hrl").
 -include("mod_roster.hrl").
 
@@ -58,10 +64,10 @@
 -define(NS_PIEFXIS, <<"http://www.xmpp.org/extensions/xep-0227.html#ns">>).
 -define(NS_XI, <<"http://www.w3.org/2001/XInclude">>).
 
--record(state, {xml_stream_state :: fxml_stream:xml_stream_state() | undefined,
+-record(state, {xml_stream_state :: fxml_stream:xml_stream_state(),
                 user = <<"">>    :: binary(),
                 server = <<"">>  :: binary(),
-                fd = self()      :: file:io_device(),
+                fd               :: file:io_device(),
                 dir = <<"">>     :: binary()}).
 
 -type state() :: #state{}.
@@ -135,7 +141,7 @@ export_host(Dir, FnH, Host) ->
         {ok, Fd} ->
             print(Fd, make_piefxis_xml_head()),
             print(Fd, make_piefxis_host_head(Host)),
-            Users = ejabberd_auth:get_users(Host),
+            Users = ejabberd_auth:get_vh_registered_users(Host),
             case export_users(Users, Host, Fd) of
                 ok ->
                     print(Fd, make_piefxis_host_tail()),
@@ -166,7 +172,7 @@ export_users([], _Server, _Fd) ->
 export_user(User, Server, Fd) ->
     Password = ejabberd_auth:get_password_s(User, Server),
     LServer = jid:nameprep(Server),
-    PasswordFormat = ejabberd_auth:password_format(LServer),
+    PasswordFormat = ejabberd_config:get_option({auth_password_format, LServer}, fun(X) -> X end, plain),
     Pass = case Password of
       {_,_,_,_} ->
         case PasswordFormat of
@@ -190,7 +196,7 @@ format_scram_password({StoredKey, ServerKey, Salt, IterationCount}) ->
   StoredKeyB64 = base64:encode(StoredKey),
   ServerKeyB64 = base64:encode(ServerKey),
   SaltB64 = base64:encode(Salt),
-  IterationCountBin = (integer_to_binary(IterationCount)),
+  IterationCountBin = list_to_binary(integer_to_list(IterationCount)),
   <<"scram:", StoredKeyB64/binary, ",", ServerKeyB64/binary, ",", SaltB64/binary, ",", IterationCountBin/binary>>.
 
 parse_scram_password(PassData) ->
@@ -200,31 +206,34 @@ parse_scram_password(PassData) ->
     storedkey = StoredKeyB64,
     serverkey = ServerKeyB64,
     salt      = SaltB64,
-    iterationcount = (binary_to_integer(IterationCountBin))
+    iterationcount = list_to_integer(binary_to_list(IterationCountBin))
   }.
 
--spec get_vcard(binary(), binary()) -> [xmlel()].
 get_vcard(User, Server) ->
-    LUser = jid:nodeprep(User),
-    LServer = jid:nameprep(Server),
-    case mod_vcard:get_vcard(LUser, LServer) of
-	error -> [];
-	Els -> Els
+    JID = jid:make(User, Server, <<>>),
+    case mod_vcard:process_sm_iq(JID, JID, #iq{type = get}) of
+        #iq{type = result, sub_el = [_|_] = VCardEls} ->
+            VCardEls;
+        _ ->
+            []
     end.
 
--spec get_offline(binary(), binary()) -> [xmlel()].
 get_offline(User, Server) ->
-    LUser = jid:nodeprep(User),
-    LServer = jid:nameprep(Server),
-    case mod_offline:get_offline_els(LUser, LServer) of
+    case mod_offline:get_offline_els(User, Server) of
         [] ->
             [];
         Els ->
-            NewEls = lists:map(fun xmpp:encode/1, Els),
+            NewEls = lists:map(
+                       fun(#xmlel{attrs = Attrs} = El) ->
+                               NewAttrs = lists:keystore(<<"xmlns">>, 1,
+                                                         Attrs,
+                                                         {<<"xmlns">>,
+                                                          <<"jabber:client">>}),
+                               El#xmlel{attrs = NewAttrs}
+                       end, Els),
             [#xmlel{name = <<"offline-messages">>, children = NewEls}]
     end.
 
--spec get_privacy(binary(), binary()) -> [xmlel()].
 get_privacy(User, Server) ->
     case mod_privacy:get_user_lists(User, Server) of
         {ok, #privacy{default = Default,
@@ -232,18 +241,27 @@ get_privacy(User, Server) ->
             XLists = lists:map(
                        fun({Name, Items}) ->
                                XItems = lists:map(
-					  fun mod_privacy:encode_list_item/1,
-					  Items),
-			       #privacy_list{name = Name, items = XItems}
+                                          fun mod_privacy:item_to_xml/1, Items),
+                               #xmlel{name = <<"list">>,
+                                      attrs = [{<<"name">>, Name}],
+                                      children = XItems}
                        end, Lists),
-	    [xmpp:encode(#privacy_query{default = Default, lists = XLists})];
+            DefaultEl = case Default of
+                            none ->
+                                [];
+                            _ ->
+                                [#xmlel{name = <<"default">>,
+                                        attrs = [{<<"name">>, Default}]}]
+                        end,
+            [#xmlel{name = <<"query">>,
+                    attrs = [{<<"xmlns">>, ?NS_PRIVACY}],
+                    children = DefaultEl ++ XLists}];
         _ ->
             []
     end.
 
--spec get_roster(binary(), binary()) -> [xmlel()].
 get_roster(User, Server) ->
-    JID = jid:make(User, Server),
+    JID = jid:make(User, Server, <<>>),
     case mod_roster:get_roster(User, Server) of
         [_|_] = Items ->
             Subs =
@@ -254,11 +272,18 @@ get_roster(User, Server) ->
                           Status = if is_binary(Msg) -> (Msg);
                                       true -> <<"">>
                                    end,
-			  [xmpp:encode(
-			     #presence{from = jid:make(R#roster.jid),
-				       to = JID,
-				       type = subscribe,
-				       status = xmpp:mk_text(Status)})];
+                          [#xmlel{name = <<"presence">>,
+                                  attrs =
+                                      [{<<"from">>,
+                                        jid:to_string(R#roster.jid)},
+                                       {<<"to">>, jid:to_string(JID)},
+                                       {<<"xmlns">>, <<"jabber:client">>},
+                                       {<<"type">>, <<"subscribe">>}],
+                                  children =
+                                      [#xmlel{name = <<"status">>,
+                                              attrs = [],
+                                              children =
+                                                  [{xmlcdata, Status}]}]}];
                      (_) ->
                           []
                   end, Items),
@@ -266,18 +291,21 @@ get_roster(User, Server) ->
                    fun(#roster{ask = in, subscription = none}) ->
                            [];
                       (R) ->
-                           [mod_roster:encode_item(R)]
+                           [mod_roster:item_to_xml(R)]
                    end, Items),
-	    [xmpp:encode(#roster_query{items = Rs}) | Subs];
+            [#xmlel{name = <<"query">>,
+                    attrs = [{<<"xmlns">>, ?NS_ROSTER}],
+                    children = Rs} | Subs];
         _ ->
             []
     end.
 
--spec get_private(binary(), binary()) -> [xmlel()].
 get_private(User, Server) ->
     case mod_private:get_data(User, Server) of
         [_|_] = Els ->
-	    [xmpp:encode(#private{xml_els = Els})];
+            [#xmlel{name = <<"query">>,
+                    attrs = [{<<"xmlns">>, ?NS_PRIVATE}],
+                    children = Els}];
         _ ->
             []
     end.
@@ -342,15 +370,15 @@ process_el({xmlstreamelement, #xmlel{name = <<"host">>,
                                      attrs = Attrs,
                                      children = Els}}, State) ->
     JIDS = fxml:get_attr_s(<<"jid">>, Attrs),
-    try jid:decode(JIDS) of
+    case jid:from_string(JIDS) of
         #jid{lserver = S} ->
-            case ejabberd_router:is_my_host(S) of
+            case lists:member(S, ?MYHOSTS) of
                 true ->
                     process_users(Els, State#state{server = S});
                 false ->
                     stop("Unknown host: ~s", [S])
-            end
-    catch _:{bad_jid, _} ->
+            end;
+        error ->
             stop("Invalid 'jid': ~s", [JIDS])
     end;
 process_el({xmlstreamstart, <<"user">>, Attrs}, State = #state{server = S})
@@ -386,7 +414,7 @@ process_user(#xmlel{name = <<"user">>, attrs = Attrs, children = Els},
              #state{server = LServer} = State) ->
     Name = fxml:get_attr_s(<<"name">>, Attrs),
     Password = fxml:get_attr_s(<<"password">>, Attrs),
-    PasswordFormat = ejabberd_auth:password_format(LServer),
+    PasswordFormat = ejabberd_config:get_option({auth_password_format, LServer}, fun(X) -> X end, plain),
     Pass = case PasswordFormat of
       scram ->
         case Password of 
@@ -402,9 +430,9 @@ process_user(#xmlel{name = <<"user">>, attrs = Attrs, children = Els},
             stop("Invalid 'user': ~s", [Name]);
         LUser ->
             case ejabberd_auth:try_register(LUser, LServer, Pass) of
-                ok ->
+                {atomic, _} ->
                     process_user_els(Els, State#state{user = LUser});
-                {error, Err} ->
+                Err ->
                     stop("Failed to create user '~s': ~p", [Name, Err])
             end
     end.
@@ -423,117 +451,129 @@ process_user_els([], State) ->
 
 process_user_el(#xmlel{name = Name, attrs = Attrs, children = Els} = El,
                 State) ->
-    try
-	case {Name, fxml:get_attr_s(<<"xmlns">>, Attrs)} of
-	    {<<"query">>, ?NS_ROSTER} ->
-		process_roster(xmpp:decode(El), State);
-	    {<<"query">>, ?NS_PRIVACY} ->
-		%% Make sure <list/> elements go before <active/> and <default/>
-		process_privacy(xmpp:decode(El), State);
-	    {<<"query">>, ?NS_PRIVATE} ->
-		process_private(xmpp:decode(El), State);
-	    {<<"vCard">>, ?NS_VCARD} ->
-		process_vcard(El, State);
-	    {<<"offline-messages">>, NS} ->
-		Msgs = [xmpp:decode(E, NS, [ignore_els]) || E <- Els],
-		process_offline_msgs(Msgs, State);
-	    {<<"presence">>, ?NS_CLIENT} ->
-		process_presence(xmpp:decode(El, ?NS_CLIENT, [ignore_els]), State);
-	    _ ->
-		{ok, State}
-	end
-    catch _:{xmpp_codec, Why} ->
-	    ErrTxt = xmpp:format_error(Why),
-	    stop("failed to decode XML '~s': ~s",
-		 [fxml:element_to_binary(El), ErrTxt])
+    case {Name, fxml:get_attr_s(<<"xmlns">>, Attrs)} of
+        {<<"query">>, ?NS_ROSTER} ->
+            process_roster(El, State);
+        {<<"query">>, ?NS_PRIVACY} ->
+            %% Make sure <list/> elements go before <active/> and <default/>
+            NewEls = lists:reverse(lists:keysort(#xmlel.name, Els)),
+            process_privacy_el(El#xmlel{children = NewEls}, State);
+        {<<"query">>, ?NS_PRIVATE} ->
+            process_private(El, State);
+        {<<"vCard">>, ?NS_VCARD} ->
+            process_vcard(El, State);
+        {<<"offline-messages">>, _} ->
+            process_offline_msgs(Els, State);
+        {<<"presence">>, <<"jabber:client">>} ->
+            process_presence(El, State);
+        _ ->
+            {ok, State}
     end.
 
--spec process_offline_msgs([stanza()], state()) -> {ok, state()} | {error, _}.
-process_offline_msgs([#message{} = Msg|Msgs], State) ->
-    case process_offline_msg(Msg, State) of
+process_privacy_el(#xmlel{children = [#xmlel{} = SubEl|SubEls]} = El, State) ->
+    case process_privacy(#xmlel{children = [SubEl]}, State) of
         {ok, NewState} ->
-            process_offline_msgs(Msgs, NewState);
+            process_privacy_el(El#xmlel{children = SubEls}, NewState);
         Err ->
             Err
     end;
-process_offline_msgs([_|Msgs], State) ->
-    process_offline_msgs(Msgs, State);
+process_privacy_el(#xmlel{children = [_|SubEls]} = El, State) ->
+    process_privacy_el(El#xmlel{children = SubEls}, State);
+process_privacy_el(#xmlel{children = []}, State) ->
+    {ok, State}.
+
+process_offline_msgs([#xmlel{} = El|Els], State) ->
+    case process_offline_msg(El, State) of
+        {ok, NewState} ->
+            process_offline_msgs(Els, NewState);
+        Err ->
+            Err
+    end;
+process_offline_msgs([_|Els], State) ->
+    process_offline_msgs(Els, State);
 process_offline_msgs([], State) ->
     {ok, State}.
 
--spec process_roster(roster_query(), state()) -> {ok, state()} | {error, _}.
-process_roster(RosterQuery, State = #state{user = U, server = S}) ->
-    case mod_roster:set_items(U, S, RosterQuery) of
+process_roster(El, State = #state{user = U, server = S}) ->
+    case mod_roster:set_items(U, S, El) of
         {atomic, _} ->
             {ok, State};
         Err ->
             stop("Failed to write roster: ~p", [Err])
     end.
 
--spec process_privacy(privacy_query(), state()) -> {ok, state()} | {error, _}.
-process_privacy(#privacy_query{lists = Lists,
-			       default = Default,
-			       active = Active} = PrivacyQuery,
-		State = #state{user = U, server = S}) ->
-    JID = jid:make(U, S),
-    IQ = #iq{type = set, id = randoms:get_string(),
-	     from = JID, to = JID, sub_els = [PrivacyQuery]},
-    case mod_privacy:process_iq(IQ) of
-	#iq{type = error} = ResIQ ->
-	    #stanza_error{reason = Reason} = xmpp:get_error(ResIQ),
-	    if Reason == 'item-not-found', Lists == [],
-	       Active == undefined, Default /= undefined ->
-		    %% Failed to set default list because there is no
-		    %% list with such name. We shouldn't stop here.
-		    {ok, State};
-	       true ->
-		    stop("Failed to write privacy: ~p", [Reason])
+process_privacy(El, State = #state{user = U, server = S}) ->
+    JID = jid:make(U, S, <<"">>),
+    case mod_privacy:process_iq_set(
+           [], JID, JID, #iq{type = set, sub_el = El}) of
+        {error, Error} = Err ->
+            #xmlel{children = Els} = El,
+            Name = case fxml:remove_cdata(Els) of
+              [#xmlel{name = N}] -> N;
+              _ -> undefined
+            end,
+            #xmlel{attrs = Attrs} = Error,
+            ErrorCode = case lists:keysearch(<<"code">>, 1, Attrs) of
+              {value, {_, V}} -> V;
+              false -> undefined
+            end,
+            if 
+              ErrorCode == <<"404">>, Name == <<"default">> ->
+                {ok, State};
+              true ->
+                stop("Failed to write privacy: ~p", [Err])
             end;
         _ ->
             {ok, State}
     end.
 
--spec process_private(private(), state()) -> {ok, state()} | {error, _}.
-process_private(Private, State = #state{user = U, server = S}) ->
-    JID = jid:make(U, S),
-    IQ = #iq{type = set, id = randoms:get_string(),
-	     from = JID, to = JID, sub_els = [Private]},
-    case mod_private:process_sm_iq(IQ) of
+process_private(El, State = #state{user = U, server = S}) ->
+    JID = jid:make(U, S, <<"">>),
+    case mod_private:process_sm_iq(
+           JID, JID, #iq{type = set, sub_el = El}) of
         #iq{type = result} ->
             {ok, State};
         Err ->
             stop("Failed to write private: ~p", [Err])
     end.
 
--spec process_vcard(xmlel(), state()) -> {ok, state()} | {error, _}.
 process_vcard(El, State = #state{user = U, server = S}) ->
-    JID = jid:make(U, S),
-    IQ = #iq{type = set, id = randoms:get_string(),
-	     from = JID, to = JID, sub_els = [El]},
-    case mod_vcard:process_sm_iq(IQ) of
+    JID = jid:make(U, S, <<"">>),
+    case mod_vcard:process_sm_iq(
+           JID, JID, #iq{type = set, sub_el = El}) of
         #iq{type = result} ->
             {ok, State};
         Err ->
             stop("Failed to write vcard: ~p", [Err])
     end.
 
--spec process_offline_msg(message(), state()) -> {ok, state()} | {error, _}.
-process_offline_msg(#message{from = undefined}, _State) ->
-    stop("No 'from' attribute found", []);
-process_offline_msg(Msg, State = #state{user = U, server = S}) ->
-    To = jid:make(U, S),
-    ejabberd_hooks:run_fold(
-      offline_message_hook, To#jid.lserver, {pass, xmpp:set_to(Msg, To)}, []),
-    {ok, State}.
+process_offline_msg(El, State = #state{user = U, server = S}) ->
+    FromS = fxml:get_attr_s(<<"from">>, El#xmlel.attrs),
+    case jid:from_string(FromS) of
+        #jid{} = From ->
+            To = jid:make(U, S, <<>>),
+            NewEl = jlib:replace_from_to(From, To, El),
+            case catch mod_offline:store_packet(From, To, NewEl) of
+                {'EXIT', _} = Err ->
+                    stop("Failed to store offline message: ~p", [Err]);
+                _ ->
+                    {ok, State}
+            end;
+        _ ->
+            stop("Invalid 'from' = ~s", [FromS])
+    end.
 
--spec process_presence(presence(), state()) -> {ok, state()} | {error, _}.
-process_presence(#presence{from = undefined}, _State) ->
-    stop("No 'from' attribute found", []);
-process_presence(Pres, #state{user = U, server = S} = State) ->
-    To = jid:make(U, S),
-    NewPres = xmpp:set_to(Pres, To),
-    ejabberd_router:route(NewPres),
-    {ok, State}.
+process_presence(El, #state{user = U, server = S} = State) ->
+    FromS = fxml:get_attr_s(<<"from">>, El#xmlel.attrs),
+    case jid:from_string(FromS) of
+        #jid{} = From ->
+            To = jid:make(U, S, <<>>),
+            NewEl = jlib:replace_from_to(From, To, El),
+            ejabberd_router:route(From, To, NewEl),
+            {ok, State};
+        _ ->
+            stop("Invalid 'from' = ~s", [FromS])
+    end.
 
 stop(Fmt, Args) ->
     ?ERROR_MSG(Fmt, Args),
@@ -541,8 +581,9 @@ stop(Fmt, Args) ->
 
 make_filename_template() ->
     {{Year, Month, Day}, {Hour, Minute, Second}} = calendar:local_time(),
-    str:format("~4..0w~2..0w~2..0w-~2..0w~2..0w~2..0w",
-	       [Year, Month, Day, Hour, Minute, Second]).
+    list_to_binary(
+      io_lib:format("~4..0w~2..0w~2..0w-~2..0w~2..0w~2..0w",
+		    [Year, Month, Day, Hour, Minute, Second])).
 
 make_main_basefilename(Dir, FnT) ->
     Filename2 = <<FnT/binary, ".xml">>,
@@ -593,3 +634,7 @@ make_xinclude(Fn) ->
 
 print(Fd, String) ->
     file:write(Fd, String).
+
+opt_type(auth_password_format) -> fun (X) -> X end;
+opt_type(_) -> [auth_password_format].
+

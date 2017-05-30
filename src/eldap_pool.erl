@@ -5,7 +5,7 @@
 %%% Created : 12 Nov 2006 by Evgeniy Khramtsov <xram@jabber.ru>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2016   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -83,4 +83,4 @@ do_request(Name, {F, Args}) ->
     end.
 
 make_id(Name) ->
-    misc:binary_to_atom(<<"eldap_pool_", Name/binary>>).
+    jlib:binary_to_atom(<<"eldap_pool_", Name/binary>>).

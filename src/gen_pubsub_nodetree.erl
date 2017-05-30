@@ -5,7 +5,7 @@
 %%% Created :  1 Dec 2007 by Christophe Romain <christophe.romain@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2016   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -25,6 +25,7 @@
 
 -module(gen_pubsub_nodetree).
 
+-include("jlib.hrl").
 
 -type(host() :: mod_pubsub:host()).
 -type(nodeId() :: mod_pubsub:nodeId()).
@@ -36,32 +37,30 @@
 	ServerHost :: binary(),
 	Opts :: [any()]) -> atom().
 
--include("xmpp.hrl").
-
 -callback terminate(Host :: host(), ServerHost :: binary()) -> atom().
 
 -callback options() -> nodeOptions().
 
 -callback set_node(PubsubNode :: pubsubNode()) ->
-    ok | {result, NodeIdx::nodeIdx()} | {error, stanza_error()}.
+    ok | {result, NodeIdx::nodeIdx()} | {error, xmlel()}.
 
 -callback get_node(Host   :: host(),
 	NodeId :: nodeId(),
-	From   :: jid:jid()) ->
+	From   :: jid()) ->
     pubsubNode() |
-    {error, stanza_error()}.
+    {error, xmlel()}.
 
 -callback get_node(Host :: host(),
 	NodeId :: nodeId()) ->
     pubsubNode() |
-    {error, stanza_error()}.
+    {error, xmlel()}.
 
 -callback get_node(NodeIdx :: nodeIdx()) ->
     pubsubNode() |
-    {error, stanza_error()}.
+    {error, xmlel()}.
 
 -callback get_nodes(Host :: host(),
-	From :: jid:jid())->
+	From :: jid())->
     [pubsubNode()].
 
 -callback get_nodes(Host :: host())->
@@ -69,33 +68,33 @@
 
 -callback get_parentnodes(Host :: host(),
 	NodeId :: nodeId(),
-	From :: jid:jid()) ->
+	From :: jid()) ->
     [pubsubNode()] |
-    {error, stanza_error()}.
+    {error, xmlel()}.
 
 -callback get_parentnodes_tree(Host :: host(),
 	NodeId :: nodeId(),
-	From :: jid:jid()) ->
+	From :: jid()) ->
     [{0, [pubsubNode(),...]}].
 
 -callback get_subnodes(Host :: host(),
 	NodeId :: nodeId(),
-	From :: jid:jid()) ->
+	From :: jid()) ->
     [pubsubNode()].
 
 -callback get_subnodes_tree(Host :: host(),
 	NodeId :: nodeId(),
-	From :: jid:jid()) ->
+	From :: jid()) ->
     [pubsubNode()].
 
 -callback create_node(Host :: host(),
 	NodeId :: nodeId(),
 	Type :: binary(),
-	Owner :: jid:jid(),
+	Owner :: jid(),
 	Options :: nodeOptions(),
 	Parents :: [nodeId()]) ->
     {ok, NodeIdx::nodeIdx()} |
-    {error, stanza_error()} |
+    {error, xmlel()} |
     {error, {virtual, {host(), nodeId()}}}.
 
 -callback delete_node(Host :: host(),

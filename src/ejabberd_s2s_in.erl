@@ -1,8 +1,11 @@
-%%%-------------------------------------------------------------------
-%%% Created : 12 Dec 2016 by Evgeny Khramtsov <ekhramtsov@process-one.net>
+%%%----------------------------------------------------------------------
+%%% File    : ejabberd_s2s_in.erl
+%%% Author  : Alexey Shchepin <alexey@process-one.net>
+%%% Purpose : Serve incoming s2s connection
+%%% Created :  6 Dec 2002 by Alexey Shchepin <alexey@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2016   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -18,363 +21,676 @@
 %%% with this program; if not, write to the Free Software Foundation, Inc.,
 %%% 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 %%%
-%%%-------------------------------------------------------------------
--module(ejabberd_s2s_in).
--behaviour(xmpp_stream_in).
--behaviour(ejabberd_socket).
+%%%----------------------------------------------------------------------
 
-%% ejabberd_socket callbacks
+-module(ejabberd_s2s_in).
+
+-behaviour(ejabberd_config).
+
+-author('alexey@process-one.net').
+
+-behaviour(p1_fsm).
+
+%% External exports
 -export([start/2, start_link/2, socket_type/0]).
-%% ejabberd_listener callbacks
--export([listen_opt_type/1]).
-%% xmpp_stream_in callbacks
--export([init/1, handle_call/3, handle_cast/2,
-	 handle_info/2, terminate/2, code_change/3]).
--export([tls_options/1, tls_required/1, tls_verify/1, tls_enabled/1,
-	 compress_methods/1,
-	 unauthenticated_stream_features/1, authenticated_stream_features/1,
-	 handle_stream_start/2, handle_stream_end/2,
-	 handle_stream_established/1, handle_auth_success/4,
-	 handle_auth_failure/4, handle_send/3, handle_recv/3, handle_cdata/2,
-	 handle_unauthenticated_packet/2, handle_authenticated_packet/2]).
-%% Hooks
--export([handle_unexpected_info/2, handle_unexpected_cast/2,
-	 reject_unauthenticated_packet/2, process_closed/2]).
-%% API
--export([stop/1, close/1, close/2, send/2, update_state/2, establish/1,
-	 host_up/1, host_down/1]).
+
+-export([init/1, wait_for_stream/2,
+	 wait_for_feature_request/2, stream_established/2,
+	 handle_event/3, handle_sync_event/4, code_change/4,
+	 handle_info/3, print_state/1, terminate/3, opt_type/1]).
 
 -include("ejabberd.hrl").
--include("xmpp.hrl").
 -include("logger.hrl").
 
--type state() :: map().
--export_type([state/0]).
+-include("jlib.hrl").
 
-%%%===================================================================
-%%% API
-%%%===================================================================
+-define(DICT, dict).
+
+-record(state,
+	{socket                      :: ejabberd_socket:socket_state(),
+         sockmod = ejabberd_socket   :: ejabberd_socket | ejabberd_frontend_socket,
+         streamid = <<"">>           :: binary(),
+         shaper = none               :: shaper:shaper(),
+         tls = false                 :: boolean(),
+	 tls_enabled = false         :: boolean(),
+         tls_required = false        :: boolean(),
+	 tls_certverify = false      :: boolean(),
+         tls_options = []            :: list(),
+         server = <<"">>             :: binary(),
+	 authenticated = false       :: boolean(),
+         auth_domain = <<"">>        :: binary(),
+	 connections = (?DICT):new() :: ?TDICT,
+         timer = make_ref()          :: reference()}).
+
+%-define(DBGFSM, true).
+
+-ifdef(DBGFSM).
+
+-define(FSMOPTS, [{debug, [trace]}]).
+
+-else.
+
+-define(FSMOPTS, []).
+
+-endif.
+
+-define(STREAM_HEADER(Version),
+	<<"<?xml version='1.0'?><stream:stream "
+	  "xmlns:stream='http://etherx.jabber.org/stream"
+	  "s' xmlns='jabber:server' xmlns:db='jabber:ser"
+	  "ver:dialback' id='",
+	  (StateData#state.streamid)/binary, "'", Version/binary,
+	  ">">>).
+
+-define(STREAM_TRAILER, <<"</stream:stream>">>).
+
+-define(INVALID_NAMESPACE_ERR,
+	fxml:element_to_binary(?SERR_INVALID_NAMESPACE)).
+
+-define(HOST_UNKNOWN_ERR,
+	fxml:element_to_binary(?SERR_HOST_UNKNOWN)).
+
+-define(INVALID_FROM_ERR,
+	fxml:element_to_binary(?SERR_INVALID_FROM)).
+
+-define(INVALID_XML_ERR,
+	fxml:element_to_binary(?SERR_XML_NOT_WELL_FORMED)).
+
 start(SockData, Opts) ->
-    case proplists:get_value(supervisor, Opts, true) of
-	true ->
-	    supervisor:start_child(ejabberd_s2s_in_sup, [SockData, Opts]);
-	_ ->
-	    xmpp_stream_in:start(?MODULE, [SockData, Opts],
-				 ejabberd_config:fsm_limit_opts(Opts))
-    end.
+    supervisor:start_child(ejabberd_s2s_in_sup,
+                            [SockData, Opts]).
 
 start_link(SockData, Opts) ->
-    xmpp_stream_in:start_link(?MODULE, [SockData, Opts],
-			      ejabberd_config:fsm_limit_opts(Opts)).
+    p1_fsm:start_link(ejabberd_s2s_in, [SockData, Opts],
+                      ?FSMOPTS ++ fsm_limit_opts(Opts)).
 
-close(Ref) ->
-    xmpp_stream_in:close(Ref).
+socket_type() -> xml_stream.
 
-close(Ref, Reason) ->
-    xmpp_stream_in:close(Ref, Reason).
+%%%----------------------------------------------------------------------
+%%% Callback functions from gen_fsm
+%%%----------------------------------------------------------------------
 
-stop(Ref) ->
-    xmpp_stream_in:stop(Ref).
+init([{SockMod, Socket}, Opts]) ->
+    ?DEBUG("started: ~p", [{SockMod, Socket}]),
+    Shaper = case lists:keysearch(shaper, 1, Opts) of
+	       {value, {_, S}} -> S;
+	       _ -> none
+	     end,
+    {StartTLS, TLSRequired, TLSCertverify} =
+        case ejabberd_config:get_option(
+               s2s_use_starttls,
+               fun(false) -> false;
+                  (true) -> true;
+                  (optional) -> optional;
+                  (required) -> required;
+                  (required_trusted) -> required_trusted
+               end,
+               false) of
+            UseTls
+              when (UseTls == undefined) or
+                   (UseTls == false) ->
+                {false, false, false};
+            UseTls
+              when (UseTls == true) or
+                   (UseTls ==
+                        optional) ->
+                {true, false, false};
+            required -> {true, true, false};
+            required_trusted ->
+                {true, true, true}
+        end,
+    TLSOpts1 = case ejabberd_config:get_option(
+                     s2s_certfile,
+                     fun iolist_to_binary/1) of
+                  undefined -> [];
+                  CertFile -> [{certfile, CertFile}]
+	      end,
+    TLSOpts2 = case ejabberd_config:get_option(
+                      s2s_ciphers, fun iolist_to_binary/1) of
+                   undefined -> TLSOpts1;
+                   Ciphers -> [{ciphers, Ciphers} | TLSOpts1]
+               end,
+    TLSOpts3 = case ejabberd_config:get_option(
+                      s2s_protocol_options,
+                      fun (Options) ->
+                              [_|O] = lists:foldl(
+                                           fun(X, Acc) -> X ++ Acc end, [],
+                                           [["|" | binary_to_list(Opt)] || Opt <- Options, is_binary(Opt)]
+                                          ),
+                              iolist_to_binary(O)
+                      end) of
+                   undefined -> TLSOpts2;
+                   ProtocolOpts -> [{protocol_options, ProtocolOpts} | TLSOpts2]
+               end,
+    TLSOpts4 = case ejabberd_config:get_option(
+                      s2s_dhfile, fun iolist_to_binary/1) of
+                   undefined -> TLSOpts3;
+                   DHFile -> [{dhfile, DHFile} | TLSOpts3]
+               end,
+    TLSOpts = case proplists:get_bool(tls_compression, Opts) of
+                  false -> [compression_none | TLSOpts4];
+                  true -> TLSOpts4
+              end,
+    Timer = erlang:start_timer(?S2STIMEOUT, self(), []),
+    {ok, wait_for_stream,
+     #state{socket = Socket, sockmod = SockMod,
+	    streamid = new_id(), shaper = Shaper, tls = StartTLS,
+	    tls_enabled = false, tls_required = TLSRequired,
+	    tls_certverify = TLSCertverify, tls_options = TLSOpts,
+	    timer = Timer}}.
 
-socket_type() ->
-    xml_stream.
+%%----------------------------------------------------------------------
+%% Func: StateName/2
+%% Returns: {next_state, NextStateName, NextStateData}          |
+%%          {next_state, NextStateName, NextStateData, Timeout} |
+%%          {stop, Reason, NewStateData}
+%%----------------------------------------------------------------------
 
--spec send(pid(), xmpp_element()) -> ok;
-	  (state(), xmpp_element()) -> state().
-send(Stream, Pkt) ->
-    xmpp_stream_in:send(Stream, Pkt).
-
--spec establish(state()) -> state().
-establish(State) ->
-    xmpp_stream_in:establish(State).
-
--spec update_state(pid(), fun((state()) -> state()) |
-		   {module(), atom(), list()}) -> ok.
-update_state(Ref, Callback) ->
-    xmpp_stream_in:cast(Ref, {update_state, Callback}).
-
--spec host_up(binary()) -> ok.
-host_up(Host) ->
-    ejabberd_hooks:add(s2s_in_closed, Host, ?MODULE,
-		       process_closed, 100),
-    ejabberd_hooks:add(s2s_in_unauthenticated_packet, Host, ?MODULE,
-		       reject_unauthenticated_packet, 100),
-    ejabberd_hooks:add(s2s_in_handle_info, Host, ?MODULE,
-		       handle_unexpected_info, 100),
-    ejabberd_hooks:add(s2s_in_handle_cast, Host, ?MODULE,
-		       handle_unexpected_cast, 100).
-
--spec host_down(binary()) -> ok.
-host_down(Host) ->
-    ejabberd_hooks:delete(s2s_in_closed, Host, ?MODULE,
-			  process_closed, 100),
-    ejabberd_hooks:delete(s2s_in_unauthenticated_packet, Host, ?MODULE,
-			  reject_unauthenticated_packet, 100),
-    ejabberd_hooks:delete(s2s_in_handle_info, Host, ?MODULE,
-			  handle_unexpected_info, 100),
-    ejabberd_hooks:delete(s2s_in_handle_cast, Host, ?MODULE,
-			  handle_unexpected_cast, 100).
-
-%%%===================================================================
-%%% Hooks
-%%%===================================================================
-handle_unexpected_info(State, Info) ->
-    ?WARNING_MSG("got unexpected info: ~p", [Info]),
-    State.
-
-handle_unexpected_cast(State, Msg) ->
-    ?WARNING_MSG("got unexpected cast: ~p", [Msg]),
-    State.
-
-reject_unauthenticated_packet(State, _Pkt) ->
-    Err = xmpp:serr_not_authorized(),
-    send(State, Err).
-
-process_closed(State, _Reason) ->
-    stop(State).
-
-%%%===================================================================
-%%% xmpp_stream_in callbacks
-%%%===================================================================
-tls_options(#{tls_options := TLSOpts, server_host := LServer}) ->
-    ejabberd_s2s:tls_options(LServer, TLSOpts).
-
-tls_required(#{server_host := LServer}) ->
-    ejabberd_s2s:tls_required(LServer).
-
-tls_verify(#{server_host := LServer}) ->
-    ejabberd_s2s:tls_verify(LServer).
-
-tls_enabled(#{server_host := LServer}) ->
-    ejabberd_s2s:tls_enabled(LServer).
-
-compress_methods(#{server_host := LServer}) ->
-    case ejabberd_s2s:zlib_enabled(LServer) of
-	true -> [<<"zlib">>];
-	false -> []
-    end.
-
-unauthenticated_stream_features(#{server_host := LServer}) ->
-    ejabberd_hooks:run_fold(s2s_in_pre_auth_features, LServer, [], [LServer]).
-
-authenticated_stream_features(#{server_host := LServer}) ->
-    ejabberd_hooks:run_fold(s2s_in_post_auth_features, LServer, [], [LServer]).
-
-handle_stream_start(_StreamStart, #{lserver := LServer} = State) ->
-    case check_to(jid:make(LServer), State) of
-	false ->
-	    send(State, xmpp:serr_host_unknown());
-	true ->
-	    ServerHost = ejabberd_router:host_of_route(LServer),
-	    State#{server_host => ServerHost}
-    end.
-
-handle_stream_end(Reason, #{server_host := LServer} = State) ->
-    State1 = State#{stop_reason => Reason},
-    ejabberd_hooks:run_fold(s2s_in_closed, LServer, State1, [Reason]).
-
-handle_stream_established(State) ->
-    set_idle_timeout(State#{established => true}).
-
-handle_auth_success(RServer, Mech, _AuthModule,
-		    #{sockmod := SockMod,
-		      socket := Socket, ip := IP,
-		      auth_domains := AuthDomains,
-		      server_host := ServerHost,
-		      lserver := LServer} = State) ->
-    ?INFO_MSG("(~s) Accepted inbound s2s ~s authentication ~s -> ~s (~s)",
-	      [SockMod:pp(Socket), Mech, RServer, LServer,
-	       ejabberd_config:may_hide_data(misc:ip_to_list(IP))]),
-    State1 = case ejabberd_s2s:allow_host(ServerHost, RServer) of
-		 true ->
-		     AuthDomains1 = sets:add_element(RServer, AuthDomains),
-		     change_shaper(State, RServer),
-		     State#{auth_domains => AuthDomains1};
-		 false ->
-		     State
-	   end,
-    ejabberd_hooks:run_fold(s2s_in_auth_result, ServerHost, State1, [true, RServer]).
-
-handle_auth_failure(RServer, Mech, Reason,
-		    #{sockmod := SockMod,
-		      socket := Socket, ip := IP,
-		      server_host := ServerHost,
-		      lserver := LServer} = State) ->
-    ?INFO_MSG("(~s) Failed inbound s2s ~s authentication ~s -> ~s (~s): ~s",
-	      [SockMod:pp(Socket), Mech, RServer, LServer,
-	       ejabberd_config:may_hide_data(misc:ip_to_list(IP)), Reason]),
-    ejabberd_hooks:run_fold(s2s_in_auth_result,
-			    ServerHost, State, [false, RServer]).
-
-handle_unauthenticated_packet(Pkt, #{server_host := LServer} = State) ->
-    ejabberd_hooks:run_fold(s2s_in_unauthenticated_packet,
-			    LServer, State, [Pkt]).
-
-handle_authenticated_packet(Pkt, #{server_host := LServer} = State) when not ?is_stanza(Pkt) ->
-    ejabberd_hooks:run_fold(s2s_in_authenticated_packet, LServer, State, [Pkt]);
-handle_authenticated_packet(Pkt0, #{ip := {IP, _}} = State) ->
-    Pkt = xmpp:put_meta(Pkt0, ip, IP),
-    From = xmpp:get_from(Pkt),
-    To = xmpp:get_to(Pkt),
-    case check_from_to(From, To, State) of
-	ok ->
-	    LServer = ejabberd_router:host_of_route(To#jid.lserver),
-	    State1 = ejabberd_hooks:run_fold(s2s_in_authenticated_packet,
-					     LServer, State, [Pkt]),
-	    {Pkt1, State2} = ejabberd_hooks:run_fold(s2s_receive_packet, LServer,
-						     {Pkt, State1}, []),
-	    case Pkt1 of
-		drop -> ok;
-		_ -> ejabberd_router:route(Pkt1)
-    end,
-	    State2;
-	{error, Err} ->
-	    send(State, Err)
-    end.
-
-handle_cdata(Data, #{server_host := LServer} = State) ->
-    ejabberd_hooks:run_fold(s2s_in_handle_cdata, LServer, State, [Data]).
-
-handle_recv(El, Pkt, #{server_host := LServer} = State) ->
-    State1 = set_idle_timeout(State),
-    ejabberd_hooks:run_fold(s2s_in_handle_recv, LServer, State1, [El, Pkt]).
-
-handle_send(Pkt, Result, #{server_host := LServer} = State) ->
-    ejabberd_hooks:run_fold(s2s_in_handle_send, LServer,
-			    State, [Pkt, Result]).
-
-init([State, Opts]) ->
-    Shaper = proplists:get_value(shaper, Opts, none),
-    TLSOpts1 = lists:filter(
-		 fun({certfile, _}) -> true;
-		    ({ciphers, _}) -> true;
-		    ({dhfile, _}) -> true;
-		    ({cafile, _}) -> true;
-		    ({protocol_options, _}) -> true;
-		    (_) -> false
-		 end, Opts),
-    TLSOpts2 = case proplists:get_bool(tls_compression, Opts) of
-                   false -> [compression_none | TLSOpts1];
-                   true -> TLSOpts1
-    end,
-    State1 = State#{tls_options => TLSOpts2,
-		    auth_domains => sets:new(),
-		    xmlns => ?NS_SERVER,
-		    lang => ?MYLANG,
-		    server => ?MYNAME,
-		    lserver => ?MYNAME,
-		    server_host => ?MYNAME,
-		    established => false,
-		    shaper => Shaper},
-    ejabberd_hooks:run_fold(s2s_in_init, {ok, State1}, [Opts]).
-
-handle_call(Request, From, #{server_host := LServer} = State) ->
-    ejabberd_hooks:run_fold(s2s_in_handle_call, LServer, State, [Request, From]).
-
-handle_cast({update_state, Fun}, State) ->
-    case Fun of
-	{M, F, A} -> erlang:apply(M, F, [State|A]);
-	_ when is_function(Fun) -> Fun(State)
+wait_for_stream({xmlstreamstart, _Name, Attrs},
+		StateData) ->
+    case {fxml:get_attr_s(<<"xmlns">>, Attrs),
+	  fxml:get_attr_s(<<"xmlns:db">>, Attrs),
+	  fxml:get_attr_s(<<"to">>, Attrs),
+	  fxml:get_attr_s(<<"version">>, Attrs) == <<"1.0">>}
+	of
+      {<<"jabber:server">>, _, Server, true}
+	  when StateData#state.tls and
+		 not StateData#state.authenticated ->
+	  send_text(StateData,
+		    ?STREAM_HEADER(<<" version='1.0'">>)),
+	  Auth = if StateData#state.tls_enabled ->
+			case jid:nameprep(fxml:get_attr_s(<<"from">>, Attrs)) of
+			  From when From /= <<"">>, From /= error ->
+			      {Result, Message} =
+				  ejabberd_s2s:check_peer_certificate(StateData#state.sockmod,
+								      StateData#state.socket,
+								      From),
+			      {Result, From, Message};
+			  _ ->
+			      {error, <<"(unknown)">>,
+			       <<"Got no valid 'from' attribute">>}
+			end;
+		    true ->
+			{no_verify, <<"(unknown)">>,
+			 <<"TLS not (yet) enabled">>}
+		 end,
+	  StartTLS = if StateData#state.tls_enabled -> [];
+			not StateData#state.tls_enabled and
+			  not StateData#state.tls_required ->
+			    [#xmlel{name = <<"starttls">>,
+				    attrs = [{<<"xmlns">>, ?NS_TLS}],
+				    children = []}];
+			not StateData#state.tls_enabled and
+			  StateData#state.tls_required ->
+			    [#xmlel{name = <<"starttls">>,
+				    attrs = [{<<"xmlns">>, ?NS_TLS}],
+				    children =
+					[#xmlel{name = <<"required">>,
+						attrs = [], children = []}]}]
+		     end,
+	  case Auth of
+	    {error, RemoteServer, CertError}
+		when StateData#state.tls_certverify ->
+		?INFO_MSG("Closing s2s connection: ~s <--> ~s (~s)",
+			  [StateData#state.server, RemoteServer, CertError]),
+		send_text(StateData,
+			  <<(fxml:element_to_binary(?SERRT_POLICY_VIOLATION(<<"en">>,
+									   CertError)))/binary,
+			    (?STREAM_TRAILER)/binary>>),
+		{stop, normal, StateData};
+	    {VerifyResult, RemoteServer, Msg} ->
+		{SASL, NewStateData} = case VerifyResult of
+					 ok ->
+					     {[#xmlel{name = <<"mechanisms">>,
+						      attrs = [{<<"xmlns">>, ?NS_SASL}],
+						      children =
+							  [#xmlel{name = <<"mechanism">>,
+								  attrs = [],
+								  children =
+								      [{xmlcdata,
+									<<"EXTERNAL">>}]}]}],
+					      StateData#state{auth_domain = RemoteServer}};
+					 error ->
+					     ?DEBUG("Won't accept certificate of ~s: ~s",
+						    [RemoteServer, Msg]),
+					     {[], StateData};
+					 no_verify ->
+					     {[], StateData}
+				       end,
+		send_element(NewStateData,
+			     #xmlel{name = <<"stream:features">>, attrs = [],
+				    children =
+					SASL ++
+					  StartTLS ++
+					    ejabberd_hooks:run_fold(s2s_stream_features,
+								    Server, [],
+								    [Server])}),
+		{next_state, wait_for_feature_request,
+		 NewStateData#state{server = Server}}
+	  end;
+      {<<"jabber:server">>, _, Server, true}
+	  when StateData#state.authenticated ->
+	  send_text(StateData,
+		    ?STREAM_HEADER(<<" version='1.0'">>)),
+	  send_element(StateData,
+		       #xmlel{name = <<"stream:features">>, attrs = [],
+			      children =
+				  ejabberd_hooks:run_fold(s2s_stream_features,
+							  Server, [],
+							  [Server])}),
+	  {next_state, stream_established, StateData};
+      {<<"jabber:server">>, <<"jabber:server:dialback">>,
+       _Server, _} when
+	      (StateData#state.tls_required and StateData#state.tls_enabled)
+	      or (not StateData#state.tls_required) ->
+	  send_text(StateData, ?STREAM_HEADER(<<"">>)),
+	  {next_state, stream_established, StateData};
+      _ ->
+	  send_text(StateData, ?INVALID_NAMESPACE_ERR),
+	  {stop, normal, StateData}
     end;
-handle_cast(Msg, #{server_host := LServer} = State) ->
-    ejabberd_hooks:run_fold(s2s_in_handle_cast, LServer, State, [Msg]).
+wait_for_stream({xmlstreamerror, _}, StateData) ->
+    send_text(StateData,
+	      <<(?STREAM_HEADER(<<"">>))/binary,
+		(?INVALID_XML_ERR)/binary, (?STREAM_TRAILER)/binary>>),
+    {stop, normal, StateData};
+wait_for_stream(timeout, StateData) ->
+    {stop, normal, StateData};
+wait_for_stream(closed, StateData) ->
+    {stop, normal, StateData}.
 
-handle_info(Info, #{server_host := LServer} = State) ->
-    ejabberd_hooks:run_fold(s2s_in_handle_info, LServer, State, [Info]).
+wait_for_feature_request({xmlstreamelement, El},
+			 StateData) ->
+    #xmlel{name = Name, attrs = Attrs} = El,
+    TLS = StateData#state.tls,
+    TLSEnabled = StateData#state.tls_enabled,
+    SockMod =
+	(StateData#state.sockmod):get_sockmod(StateData#state.socket),
+    case {fxml:get_attr_s(<<"xmlns">>, Attrs), Name} of
+      {?NS_TLS, <<"starttls">>}
+	  when TLS == true, TLSEnabled == false,
+	       SockMod == gen_tcp ->
+	  ?DEBUG("starttls", []),
+	  Socket = StateData#state.socket,
+	  TLSOpts1 = case
+		      ejabberd_config:get_option(
+                        {domain_certfile, StateData#state.server},
+                        fun iolist_to_binary/1) of
+		      undefined -> StateData#state.tls_options;
+		      CertFile ->
+			  [{certfile, CertFile} | lists:keydelete(certfile, 1,
+								  StateData#state.tls_options)]
+		    end,
+          TLSOpts = case ejabberd_config:get_option(
+                           {s2s_tls_compression, StateData#state.server},
+                           fun(true) -> true;
+                              (false) -> false
+                           end, true) of
+                        true -> lists:delete(compression_none, TLSOpts1);
+                        false -> [compression_none | TLSOpts1]
+                    end,
+	  TLSSocket = (StateData#state.sockmod):starttls(Socket,
+							 TLSOpts,
+							 fxml:element_to_binary(#xmlel{name
+											  =
+											  <<"proceed">>,
+										      attrs
+											  =
+											  [{<<"xmlns">>,
+											    ?NS_TLS}],
+										      children
+											  =
+											  []})),
+	  {next_state, wait_for_stream,
+	   StateData#state{socket = TLSSocket, streamid = new_id(),
+			   tls_enabled = true, tls_options = TLSOpts}};
+      {?NS_SASL, <<"auth">>} when TLSEnabled ->
+	  Mech = fxml:get_attr_s(<<"mechanism">>, Attrs),
+	  case Mech of
+	    <<"EXTERNAL">> when StateData#state.auth_domain /= <<"">> ->
+		AuthDomain = StateData#state.auth_domain,
+		AllowRemoteHost = ejabberd_s2s:allow_host(<<"">>,
+							  AuthDomain),
+		if AllowRemoteHost ->
+		       (StateData#state.sockmod):reset_stream(StateData#state.socket),
+		       send_element(StateData,
+				    #xmlel{name = <<"success">>,
+					   attrs = [{<<"xmlns">>, ?NS_SASL}],
+					   children = []}),
+		       ?INFO_MSG("Accepted s2s EXTERNAL authentication for ~s (TLS=~p)",
+				 [AuthDomain, StateData#state.tls_enabled]),
+		       change_shaper(StateData, <<"">>,
+				     jid:make(<<"">>, AuthDomain, <<"">>)),
+		       {next_state, wait_for_stream,
+			StateData#state{streamid = new_id(),
+					authenticated = true}};
+		   true ->
+		       send_element(StateData,
+				    #xmlel{name = <<"failure">>,
+					   attrs = [{<<"xmlns">>, ?NS_SASL}],
+					   children = []}),
+		       send_text(StateData, ?STREAM_TRAILER),
+		       {stop, normal, StateData}
+		end;
+	    _ ->
+		send_element(StateData,
+			     #xmlel{name = <<"failure">>,
+				    attrs = [{<<"xmlns">>, ?NS_SASL}],
+				    children =
+					[#xmlel{name = <<"invalid-mechanism">>,
+						attrs = [], children = []}]}),
+		{stop, normal, StateData}
+	  end;
+      _ ->
+	  stream_established({xmlstreamelement, El}, StateData)
+    end;
+wait_for_feature_request({xmlstreamend, _Name},
+			 StateData) ->
+    send_text(StateData, ?STREAM_TRAILER),
+    {stop, normal, StateData};
+wait_for_feature_request({xmlstreamerror, _},
+			 StateData) ->
+    send_text(StateData,
+	      <<(?INVALID_XML_ERR)/binary,
+		(?STREAM_TRAILER)/binary>>),
+    {stop, normal, StateData};
+wait_for_feature_request(closed, StateData) ->
+    {stop, normal, StateData}.
 
-terminate(Reason, #{auth_domains := AuthDomains,
-		    sockmod := SockMod, socket := Socket} = State) ->
-    case maps:get(stop_reason, State, undefined) of
-	{tls, _} = Err ->
-	    ?ERROR_MSG("(~s) Failed to secure inbound s2s connection: ~s",
-		       [SockMod:pp(Socket), xmpp_stream_in:format_error(Err)]);
-	_ ->
-	    ok
-    end,
+stream_established({xmlstreamelement, El}, StateData) ->
+    cancel_timer(StateData#state.timer),
+    Timer = erlang:start_timer(?S2STIMEOUT, self(), []),
+    case is_key_packet(El) of
+      {key, To, From, Id, Key} ->
+	  ?DEBUG("GET KEY: ~p", [{To, From, Id, Key}]),
+	  LTo = jid:nameprep(To),
+	  LFrom = jid:nameprep(From),
+	  case {ejabberd_s2s:allow_host(LTo, LFrom),
+		lists:member(LTo,
+			     ejabberd_router:dirty_get_all_domains())}
+	      of
+	    {true, true} ->
+		ejabberd_s2s_out:terminate_if_waiting_delay(LTo, LFrom),
+		ejabberd_s2s_out:start(LTo, LFrom,
+				       {verify, self(), Key,
+					StateData#state.streamid}),
+		Conns = (?DICT):store({LFrom, LTo},
+				      wait_for_verification,
+				      StateData#state.connections),
+		change_shaper(StateData, LTo,
+			      jid:make(<<"">>, LFrom, <<"">>)),
+		{next_state, stream_established,
+		 StateData#state{connections = Conns, timer = Timer}};
+	    {_, false} ->
+		send_text(StateData, ?HOST_UNKNOWN_ERR),
+		{stop, normal, StateData};
+	    {false, _} ->
+		send_text(StateData, ?INVALID_FROM_ERR),
+		{stop, normal, StateData}
+	  end;
+      {verify, To, From, Id, Key} ->
+	  ?DEBUG("VERIFY KEY: ~p", [{To, From, Id, Key}]),
+	  LTo = jid:nameprep(To),
+	  LFrom = jid:nameprep(From),
+	  Type = case ejabberd_s2s:make_key({LTo, LFrom}, Id) of
+		     Key -> <<"valid">>;
+		     _ -> <<"invalid">>
+		 end,
+	  send_element(StateData,
+		       #xmlel{name = <<"db:verify">>,
+			      attrs =
+				  [{<<"from">>, To}, {<<"to">>, From},
+				   {<<"id">>, Id}, {<<"type">>, Type}],
+			      children = []}),
+	  {next_state, stream_established,
+	   StateData#state{timer = Timer}};
+      _ ->
+	  NewEl = jlib:remove_attr(<<"xmlns">>, El),
+	  #xmlel{name = Name, attrs = Attrs} = NewEl,
+	  From_s = fxml:get_attr_s(<<"from">>, Attrs),
+	  From = jid:from_string(From_s),
+	  To_s = fxml:get_attr_s(<<"to">>, Attrs),
+	  To = jid:from_string(To_s),
+	  if (To /= error) and (From /= error) ->
+		 LFrom = From#jid.lserver,
+		 LTo = To#jid.lserver,
+		 if StateData#state.authenticated ->
+			case LFrom == StateData#state.auth_domain andalso
+			       lists:member(LTo,
+					    ejabberd_router:dirty_get_all_domains())
+			    of
+			  true ->
+			      if (Name == <<"iq">>) or (Name == <<"message">>)
+				   or (Name == <<"presence">>) ->
+				     ejabberd_hooks:run(s2s_receive_packet, LTo,
+							[From, To, NewEl]),
+				     ejabberd_router:route(From, To, NewEl);
+				 true -> error
+			      end;
+			  false -> error
+			end;
+		    true ->
+			case (?DICT):find({LFrom, LTo},
+					  StateData#state.connections)
+			    of
+			  {ok, established} ->
+			      if (Name == <<"iq">>) or (Name == <<"message">>)
+				   or (Name == <<"presence">>) ->
+				     ejabberd_hooks:run(s2s_receive_packet, LTo,
+							[From, To, NewEl]),
+				     ejabberd_router:route(From, To, NewEl);
+				 true -> error
+			      end;
+			  _ -> error
+			end
+		 end;
+	     true -> error
+	  end,
+	  ejabberd_hooks:run(s2s_loop_debug,
+			     [{xmlstreamelement, El}]),
+	  {next_state, stream_established,
+	   StateData#state{timer = Timer}}
+    end;
+stream_established({valid, From, To}, StateData) ->
+    send_element(StateData,
+		 #xmlel{name = <<"db:result">>,
+			attrs =
+			    [{<<"from">>, To}, {<<"to">>, From},
+			     {<<"type">>, <<"valid">>}],
+			children = []}),
+    ?INFO_MSG("Accepted s2s dialback authentication for ~s (TLS=~p)",
+	      [From, StateData#state.tls_enabled]),
+    LFrom = jid:nameprep(From),
+    LTo = jid:nameprep(To),
+    NSD = StateData#state{connections =
+			      (?DICT):store({LFrom, LTo}, established,
+					    StateData#state.connections)},
+    {next_state, stream_established, NSD};
+stream_established({invalid, From, To}, StateData) ->
+    send_element(StateData,
+		 #xmlel{name = <<"db:result">>,
+			attrs =
+			    [{<<"from">>, To}, {<<"to">>, From},
+			     {<<"type">>, <<"invalid">>}],
+			children = []}),
+    LFrom = jid:nameprep(From),
+    LTo = jid:nameprep(To),
+    NSD = StateData#state{connections =
+			      (?DICT):erase({LFrom, LTo},
+					    StateData#state.connections)},
+    {next_state, stream_established, NSD};
+stream_established({xmlstreamend, _Name}, StateData) ->
+    {stop, normal, StateData};
+stream_established({xmlstreamerror, _}, StateData) ->
+    send_text(StateData,
+	      <<(?INVALID_XML_ERR)/binary,
+		(?STREAM_TRAILER)/binary>>),
+    {stop, normal, StateData};
+stream_established(timeout, StateData) ->
+    {stop, normal, StateData};
+stream_established(closed, StateData) ->
+    {stop, normal, StateData}.
+
+%%----------------------------------------------------------------------
+%% Func: StateName/3
+%% Returns: {next_state, NextStateName, NextStateData}            |
+%%          {next_state, NextStateName, NextStateData, Timeout}   |
+%%          {reply, Reply, NextStateName, NextStateData}          |
+%%          {reply, Reply, NextStateName, NextStateData, Timeout} |
+%%          {stop, Reason, NewStateData}                          |
+%%          {stop, Reason, Reply, NewStateData}
+%%----------------------------------------------------------------------
+%state_name(Event, From, StateData) ->
+%    Reply = ok,
+%    {reply, Reply, state_name, StateData}.
+
+handle_event(_Event, StateName, StateData) ->
+    {next_state, StateName, StateData}.
+
+handle_sync_event(get_state_infos, _From, StateName,
+		  StateData) ->
+    SockMod = StateData#state.sockmod,
+    {Addr, Port} = try
+		     SockMod:peername(StateData#state.socket)
+		   of
+		     {ok, {A, P}} -> {A, P};
+		     {error, _} -> {unknown, unknown}
+		   catch
+		     _:_ -> {unknown, unknown}
+		   end,
+    Domains = get_external_hosts(StateData),
+    Infos = [{direction, in}, {statename, StateName},
+	     {addr, Addr}, {port, Port},
+	     {streamid, StateData#state.streamid},
+	     {tls, StateData#state.tls},
+	     {tls_enabled, StateData#state.tls_enabled},
+	     {tls_options, StateData#state.tls_options},
+	     {authenticated, StateData#state.authenticated},
+	     {shaper, StateData#state.shaper}, {sockmod, SockMod},
+	     {domains, Domains}],
+    Reply = {state_infos, Infos},
+    {reply, Reply, StateName, StateData};
+%%----------------------------------------------------------------------
+%% Func: handle_sync_event/4
+%% Returns: {next_state, NextStateName, NextStateData}            |
+%%          {next_state, NextStateName, NextStateData, Timeout}   |
+%%          {reply, Reply, NextStateName, NextStateData}          |
+%%          {reply, Reply, NextStateName, NextStateData, Timeout} |
+%%          {stop, Reason, NewStateData}                          |
+%%          {stop, Reason, Reply, NewStateData}
+%%----------------------------------------------------------------------
+handle_sync_event(_Event, _From, StateName,
+		  StateData) ->
+    Reply = ok, {reply, Reply, StateName, StateData}.
+
+code_change(_OldVsn, StateName, StateData, _Extra) ->
+    {ok, StateName, StateData}.
+
+handle_info({send_text, Text}, StateName, StateData) ->
+    send_text(StateData, Text),
+    {next_state, StateName, StateData};
+handle_info({timeout, Timer, _}, _StateName,
+	    #state{timer = Timer} = StateData) ->
+    {stop, normal, StateData};
+handle_info(_, StateName, StateData) ->
+    {next_state, StateName, StateData}.
+
+terminate(Reason, _StateName, StateData) ->
+    ?DEBUG("terminated: ~p", [Reason]),
     case Reason of
       {process_limit, _} ->
-	    sets:fold(
-	      fun(Host, _) ->
-		      ejabberd_s2s:external_host_overloaded(Host)
-	      end, ok, AuthDomains);
-	_ ->
-	    ok
+	  [ejabberd_s2s:external_host_overloaded(Host)
+	   || Host <- get_external_hosts(StateData)];
+      _ -> ok
+    end,
+    (StateData#state.sockmod):close(StateData#state.socket),
+    ok.
+
+get_external_hosts(StateData) ->
+    case StateData#state.authenticated of
+      true -> [StateData#state.auth_domain];
+      false ->
+	  Connections = StateData#state.connections,
+	  [D
+	   || {{D, _}, established} <- dict:to_list(Connections)]
     end.
 
-code_change(_OldVsn, State, _Extra) ->
-    {ok, State}.
+print_state(State) -> State.
 
-%%%===================================================================
+%%%----------------------------------------------------------------------
 %%% Internal functions
-%%%===================================================================
--spec check_from_to(jid(), jid(), state()) -> ok | {error, stream_error()}.
-check_from_to(From, To, State) ->
-    case check_from(From, State) of
-	true ->
-	    case check_to(To, State) of
-		true ->
-		    ok;
-		false ->
-		    {error, xmpp:serr_host_unknown()}
-	    end;
-	false ->
-	    {error, xmpp:serr_invalid_from()}
+%%%----------------------------------------------------------------------
+
+send_text(StateData, Text) ->
+    (StateData#state.sockmod):send(StateData#state.socket,
+				   Text).
+
+send_element(StateData, El) ->
+    send_text(StateData, fxml:element_to_binary(El)).
+
+change_shaper(StateData, Host, JID) ->
+    Shaper = acl:match_rule(Host, StateData#state.shaper,
+			    JID),
+    (StateData#state.sockmod):change_shaper(StateData#state.socket,
+					    Shaper).
+
+new_id() -> randoms:get_string().
+
+cancel_timer(Timer) ->
+    erlang:cancel_timer(Timer),
+    receive {timeout, Timer, _} -> ok after 0 -> ok end.
+
+is_key_packet(#xmlel{name = Name, attrs = Attrs,
+		     children = Els})
+    when Name == <<"db:result">> ->
+    {key, fxml:get_attr_s(<<"to">>, Attrs),
+     fxml:get_attr_s(<<"from">>, Attrs),
+     fxml:get_attr_s(<<"id">>, Attrs), fxml:get_cdata(Els)};
+is_key_packet(#xmlel{name = Name, attrs = Attrs,
+		     children = Els})
+    when Name == <<"db:verify">> ->
+    {verify, fxml:get_attr_s(<<"to">>, Attrs),
+     fxml:get_attr_s(<<"from">>, Attrs),
+     fxml:get_attr_s(<<"id">>, Attrs), fxml:get_cdata(Els)};
+is_key_packet(_) -> false.
+
+fsm_limit_opts(Opts) ->
+    case lists:keysearch(max_fsm_queue, 1, Opts) of
+      {value, {_, N}} when is_integer(N) -> [{max_queue, N}];
+      _ ->
+	  case ejabberd_config:get_option(
+                 max_fsm_queue,
+                 fun(I) when is_integer(I), I > 0 -> I end) of
+            undefined -> [];
+	    N -> [{max_queue, N}]
+	  end
     end.
 
--spec check_from(jid(), state()) -> boolean().
-check_from(#jid{lserver = S1}, #{auth_domains := AuthDomains}) ->
-    sets:is_element(S1, AuthDomains).
-
--spec check_to(jid(), state()) -> boolean().
-check_to(#jid{lserver = LServer}, _State) ->
-    ejabberd_router:is_my_route(LServer).
-
--spec set_idle_timeout(state()) -> state().
-set_idle_timeout(#{server_host := LServer,
-		   established := true} = State) ->
-    Timeout = ejabberd_s2s:get_idle_timeout(LServer),
-    xmpp_stream_in:set_timeout(State, Timeout);
-set_idle_timeout(State) ->
-    State.
-
--spec change_shaper(state(), binary()) -> ok.
-change_shaper(#{shaper := ShaperName, server_host := ServerHost} = State,
-	      RServer) ->
-    Shaper = acl:match_rule(ServerHost, ShaperName, jid:make(RServer)),
-    xmpp_stream_in:change_shaper(State, Shaper).
-
--spec listen_opt_type(shaper) -> fun((any()) -> any());
-		     (certfile) -> fun((binary()) -> binary());
-		     (ciphers) -> fun((binary()) -> binary());
-		     (dhfile) -> fun((binary()) -> binary());
-		     (cafile) -> fun((binary()) -> binary());
-		     (protocol_options) -> fun(([binary()]) -> binary());
-		     (tls_compression) -> fun((boolean()) -> boolean());
-		     (tls) -> fun((boolean()) -> boolean());
-		     (supervisor) -> fun((boolean()) -> boolean());
-		     (max_stanza_type) -> fun((timeout()) -> timeout());
-		     (max_fsm_queue) -> fun((pos_integer()) -> pos_integer());
-		     (atom()) -> [atom()].
-listen_opt_type(shaper) -> fun acl:shaper_rules_validator/1;
-listen_opt_type(certfile) ->
-    fun(S) ->
-	    ejabberd_pkix:add_certfile(S),
-	    iolist_to_binary(S)
+opt_type(domain_certfile) -> fun iolist_to_binary/1;
+opt_type(max_fsm_queue) ->
+    fun (I) when is_integer(I), I > 0 -> I end;
+opt_type(s2s_certfile) -> fun iolist_to_binary/1;
+opt_type(s2s_ciphers) -> fun iolist_to_binary/1;
+opt_type(s2s_dhfile) -> fun iolist_to_binary/1;
+opt_type(s2s_protocol_options) ->
+    fun (Options) ->
+	    [_ | O] = lists:foldl(fun (X, Acc) -> X ++ Acc end, [],
+				  [["|" | binary_to_list(Opt)]
+				   || Opt <- Options, is_binary(Opt)]),
+	    iolist_to_binary(O)
     end;
-listen_opt_type(ciphers) -> ejabberd_s2s:opt_type(s2s_ciphers);
-listen_opt_type(dhfile) -> ejabberd_s2s:opt_type(s2s_dhfile);
-listen_opt_type(cafile) -> ejabberd_s2s:opt_type(s2s_cafile);
-listen_opt_type(protocol_options) -> ejabberd_s2s:opt_type(s2s_protocol_options);
-listen_opt_type(tls_compression) -> ejabberd_s2s:opt_type(s2s_tls_compression);
-listen_opt_type(tls) -> fun(B) when is_boolean(B) -> B end;
-listen_opt_type(supervisor) -> fun(B) when is_boolean(B) -> B end;
-listen_opt_type(max_stanza_size) ->
-    fun(I) when is_integer(I), I>0 -> I;
-       (unlimited) -> infinity;
-       (infinity) -> infinity
+opt_type(s2s_tls_compression) ->
+    fun (true) -> true;
+	(false) -> false
     end;
-listen_opt_type(max_fsm_queue) ->
-    fun(I) when is_integer(I), I>0 -> I end;
-listen_opt_type(_) ->
-    [shaper, certfile, ciphers, dhfile, cafile, protocol_options,
-     tls_compression, tls, max_fsm_queue].
+opt_type(s2s_use_starttls) ->
+    fun (false) -> false;
+	(true) -> true;
+	(optional) -> optional;
+	(required) -> required;
+	(required_trusted) -> required_trusted
+    end;
+opt_type(_) ->
+    [domain_certfile, max_fsm_queue, s2s_certfile,
+     s2s_ciphers, s2s_dhfile, s2s_protocol_options,
+     s2s_tls_compression, s2s_use_starttls].

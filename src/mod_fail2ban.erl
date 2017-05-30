@@ -1,11 +1,12 @@
 %%%-------------------------------------------------------------------
-%%% File    : mod_fail2ban.erl
-%%% Author  : Evgeny Khramtsov <ekhramtsov@process-one.net>
-%%% Purpose : 
+%%% @author Evgeny Khramtsov <ekhramtsov@process-one.net>
+%%% @doc
+%%%
+%%% @end
 %%% Created : 15 Aug 2014 by Evgeny Khramtsov <ekhramtsov@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2014-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2014-2016   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -28,17 +29,15 @@
 -behaviour(gen_server).
 
 %% API
--export([start/2, stop/1, reload/3, c2s_auth_result/3,
-	 c2s_stream_started/2]).
+-export([start_link/2, start/2, stop/1, c2s_auth_result/4, check_bl_c2s/3]).
 
 -export([init/1, handle_call/3, handle_cast/2,
 	 handle_info/2, terminate/2, code_change/3,
-	 mod_opt_type/1, depends/2]).
+	 mod_opt_type/1]).
 
 -include_lib("stdlib/include/ms_transform.hrl").
 -include("ejabberd.hrl").
 -include("logger.hrl").
--include("xmpp.hrl").
 
 -define(C2S_AUTH_BAN_LIFETIME, 3600). %% 1 hour
 -define(C2S_MAX_AUTH_FAILURES, 20).
@@ -49,54 +48,61 @@
 %%%===================================================================
 %%% API
 %%%===================================================================
--spec c2s_auth_result(ejabberd_c2s:state(), boolean(), binary())
-      -> ejabberd_c2s:state() | {stop, ejabberd_c2s:state()}.
-c2s_auth_result(#{ip := {Addr, _}, lserver := LServer} = State, false, _User) ->
+start_link(Host, Opts) ->
+    Proc = gen_mod:get_module_proc(Host, ?MODULE),
+    gen_server:start_link({local, Proc}, ?MODULE, [Host, Opts], []).
+
+c2s_auth_result(false, _User, LServer, {Addr, _Port}) ->
     case is_whitelisted(LServer, Addr) of
 	true ->
-	    State;
+	    ok;
 	false ->
 	    BanLifetime = gen_mod:get_module_opt(
 			    LServer, ?MODULE, c2s_auth_ban_lifetime,
+			    fun(T) when is_integer(T), T > 0 -> T end,
 			    ?C2S_AUTH_BAN_LIFETIME),
 	    MaxFailures = gen_mod:get_module_opt(
 			    LServer, ?MODULE, c2s_max_auth_failures,
+			    fun(I) when is_integer(I), I > 0 -> I end,
 			    ?C2S_MAX_AUTH_FAILURES),
 	    UnbanTS = p1_time_compat:system_time(seconds) + BanLifetime,
-	    Attempts = case ets:lookup(failed_auth, Addr) of
+	    case ets:lookup(failed_auth, Addr) of
 		[{Addr, N, _, _}] ->
-			       ets:insert(failed_auth,
-					  {Addr, N+1, UnbanTS, MaxFailures}),
-			       N+1;
+		    ets:insert(failed_auth, {Addr, N+1, UnbanTS, MaxFailures});
 		[] ->
-			       ets:insert(failed_auth,
-					  {Addr, 1, UnbanTS, MaxFailures}),
-			       1
-	    end,
-	    if Attempts >= MaxFailures ->
-		    log_and_disconnect(State, Attempts, UnbanTS);
-	       true ->
-		    State
+		    ets:insert(failed_auth, {Addr, 1, UnbanTS, MaxFailures})
 	    end
     end;
-c2s_auth_result(#{ip := {Addr, _}} = State, true, _User) ->
-    ets:delete(failed_auth, Addr),
-    State.
+c2s_auth_result(true, _User, _Server, _AddrPort) ->
+    ok.
 
--spec c2s_stream_started(ejabberd_c2s:state(), stream_start())
-      -> ejabberd_c2s:state() | {stop, ejabberd_c2s:state()}.
-c2s_stream_started(#{ip := {Addr, _}} = State, _) ->
+check_bl_c2s(_Acc, Addr, Lang) ->
     case ets:lookup(failed_auth, Addr) of
 	[{Addr, N, TS, MaxFailures}] when N >= MaxFailures ->
 	    case TS > p1_time_compat:system_time(seconds) of
 		true ->
-		    log_and_disconnect(State, N, TS);
+		    IP = jlib:ip_to_list(Addr),
+		    UnbanDate = format_date(
+				    calendar:now_to_universal_time(seconds_to_now(TS))),
+		    LogReason = io_lib:fwrite(
+				  "Too many (~p) failed authentications "
+				  "from this IP address (~s). The address "
+				  "will be unblocked at ~s UTC",
+				  [N, IP, UnbanDate]),
+		    ReasonT = io_lib:fwrite(
+				translate:translate(
+				  Lang,
+				  <<"Too many (~p) failed authentications "
+				    "from this IP address (~s). The address "
+				    "will be unblocked at ~s UTC">>),
+				[N, IP, UnbanDate]),
+		    {stop, {true, LogReason, ReasonT}};
 		false ->
 		    ets:delete(failed_auth, Addr),
-		    State
+		    false
 	    end;
 	_ ->
-	    State
+	    false
     end.
 
 %%====================================================================
@@ -104,24 +110,22 @@ c2s_stream_started(#{ip := {Addr, _}} = State, _) ->
 %%====================================================================
 start(Host, Opts) ->
     catch ets:new(failed_auth, [named_table, public]),
-    gen_mod:start_child(?MODULE, Host, Opts).
+    Proc = gen_mod:get_module_proc(Host, ?MODULE),
+    ChildSpec = {Proc, {?MODULE, start_link, [Host, Opts]},
+		 transient, 1000, worker, [?MODULE]},
+    supervisor:start_child(ejabberd_sup, ChildSpec).
 
 stop(Host) ->
-    gen_mod:stop_child(?MODULE, Host).
-
-reload(_Host, _NewOpts, _OldOpts) ->
-    ok.
-
-depends(_Host, _Opts) ->
-    [].
+    Proc = gen_mod:get_module_proc(Host, ?MODULE),
+    supervisor:terminate_child(ejabberd_sup, Proc),
+    supervisor:delete_child(ejabberd_sup, Proc).
 
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
 init([Host, _Opts]) ->
-    process_flag(trap_exit, true),
     ejabberd_hooks:add(c2s_auth_result, Host, ?MODULE, c2s_auth_result, 100),
-    ejabberd_hooks:add(c2s_stream_started, Host, ?MODULE, c2s_stream_started, 100),
+    ejabberd_hooks:add(check_bl_c2s, ?MODULE, check_bl_c2s, 100),
     erlang:send_after(?CLEAN_INTERVAL, self(), clean),
     {ok, #state{host = Host}}.
 
@@ -147,11 +151,11 @@ handle_info(_Info, State) ->
 
 terminate(_Reason, #state{host = Host}) ->
     ejabberd_hooks:delete(c2s_auth_result, Host, ?MODULE, c2s_auth_result, 100),
-    ejabberd_hooks:delete(c2s_stream_started, Host, ?MODULE, c2s_stream_started, 100),
-    case gen_mod:is_loaded_elsewhere(Host, ?MODULE) of
+    case is_loaded_at_other_hosts(Host) of
 	true ->
 	    ok;
 	false ->
+	    ejabberd_hooks:delete(check_bl_c2s, ?MODULE, check_bl_c2s, 100),
 	    ets:delete(failed_auth)
     end.
 
@@ -161,24 +165,19 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
--spec log_and_disconnect(ejabberd_c2s:state(), pos_integer(), non_neg_integer())
-      -> {stop, ejabberd_c2s:state()}.
-log_and_disconnect(#{ip := {Addr, _}, lang := Lang} = State, Attempts, UnbanTS) ->
-    IP = misc:ip_to_list(Addr),
-    UnbanDate = format_date(
-		  calendar:now_to_universal_time(seconds_to_now(UnbanTS))),
-    Format = <<"Too many (~p) failed authentications "
-	       "from this IP address (~s). The address "
-	       "will be unblocked at ~s UTC">>,
-    Args = [Attempts, IP, UnbanDate],
-    ?INFO_MSG("Connection attempt from blacklisted IP ~s: ~s",
-	      [IP, io_lib:fwrite(Format, Args)]),
-    Err = xmpp:serr_policy_violation({Format, Args}, Lang),
-    {stop, ejabberd_c2s:send(State, Err)}.
-
 is_whitelisted(Host, Addr) ->
-    Access = gen_mod:get_module_opt(Host, ?MODULE, access, none),
+    Access = gen_mod:get_module_opt(Host, ?MODULE, access,
+				    fun(A) when is_atom(A) -> A end,
+				    none),
     acl:match_rule(Host, Access, Addr) == allow.
+
+is_loaded_at_other_hosts(Host) ->
+    lists:any(
+      fun(VHost) when VHost == Host ->
+	      false;
+	 (VHost) ->
+	      gen_mod:is_loaded(VHost, ?MODULE)
+      end, ?MYHOSTS).
 
 seconds_to_now(Secs) ->
     {Secs div 1000000, Secs rem 1000000, 0}.
@@ -188,7 +187,7 @@ format_date({{Year, Month, Day}, {Hour, Minute, Second}}) ->
 		  [Hour, Minute, Second, Day, Month, Year]).
 
 mod_opt_type(access) ->
-    fun acl:access_rules_validator/1;
+    fun (A) when is_atom(A) -> A end;
 mod_opt_type(c2s_auth_ban_lifetime) ->
     fun (T) when is_integer(T), T > 0 -> T end;
 mod_opt_type(c2s_max_auth_failures) ->

@@ -5,7 +5,7 @@
 %%% Created :  7 May 2006 by Mickael Remond <mremond@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2016   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -26,9 +26,7 @@
 -module(ejabberd_admin).
 -author('mickael.remond@process-one.net').
 
--behaviour(gen_server).
-
--export([start_link/0,
+-export([start/0, stop/0,
 	 %% Server
 	 status/0, reopen_log/0, rotate_log/0,
 	 set_loglevel/1,
@@ -54,42 +52,18 @@
 	 dump_to_textfile/1, dump_to_textfile/2,
 	 mnesia_change_nodename/4,
 	 restore/1, % Still used by some modules
-	 clear_cache/0,
 	 get_commands_spec/0
 	]).
-%% gen_server callbacks
--export([init/1, handle_call/3, handle_cast/2, handle_info/2,
-	 terminate/2, code_change/3]).
 
 -include("ejabberd.hrl").
 -include("logger.hrl").
 -include("ejabberd_commands.hrl").
 
--record(state, {}).
+start() ->
+    ejabberd_commands:register_commands(get_commands_spec()).
 
-start_link() ->
-    gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
-
-init([]) ->
-    process_flag(trap_exit, true),
-    ejabberd_commands:register_commands(get_commands_spec()),
-    {ok, #state{}}.
-
-handle_call(_Request, _From, State) ->
-    Reply = ok,
-    {reply, Reply, State}.
-
-handle_cast(_Msg, State) ->
-    {noreply, State}.
-
-handle_info(_Info, State) ->
-    {noreply, State}.
-
-terminate(_Reason, _State) ->
+stop() ->
     ejabberd_commands:unregister_commands(get_commands_spec()).
-
-code_change(_OldVsn, State, _Extra) ->
-    {ok, State}.
 
 %%%
 %%% ejabberd commands
@@ -102,9 +76,6 @@ get_commands_spec() ->
      #ejabberd_commands{name = status, tags = [server],
 			desc = "Get status of the ejabberd server",
 			module = ?MODULE, function = status,
-			result_desc = "Result tuple",
-			result_example = {ok, <<"The node ejabberd@localhost is started with status: started"
-			    "ejabberd X.X is running in that node">>},
 			args = [], result = {res, restuple}},
      #ejabberd_commands{name = stop, tags = [server],
 			desc = "Stop ejabberd gracefully",
@@ -116,7 +87,6 @@ get_commands_spec() ->
 			args = [], result = {res, rescode}},
      #ejabberd_commands{name = reopen_log, tags = [logs, server],
 			desc = "Reopen the log files",
-			policy = admin,
 			module = ?MODULE, function = reopen_log,
 			args = [], result = {res, rescode}},
      #ejabberd_commands{name = rotate_log, tags = [logs, server],
@@ -130,15 +100,11 @@ get_commands_spec() ->
 			    "ejabberdctl stop_kindly 60 "
 			    "\\\"The server will stop in one minute.\\\"",
 			module = ?MODULE, function = stop_kindly,
-			args_desc = ["Seconds to wait", "Announcement to send, with quotes"],
-			args_example = [60, <<"Server will stop now.">>],
 			args = [{delay, integer}, {announcement, string}],
 			result = {res, rescode}},
      #ejabberd_commands{name = get_loglevel, tags = [logs, server],
 			desc = "Get the current loglevel",
 			module = ejabberd_logger, function = get,
-			result_desc = "Tuple with the log level number, its keyword and description",
-			result_example = {4, info, <<"Info">>},
 			args = [],
                         result = {leveltuple, {tuple, [{levelnumber, integer},
                                                        {levelatom, atom},
@@ -147,10 +113,6 @@ get_commands_spec() ->
      #ejabberd_commands{name = set_loglevel, tags = [logs, server],
 			desc = "Set the loglevel (0 to 5)",
 			module = ?MODULE, function = set_loglevel,
-			args_desc = ["Integer of the desired logging level, between 1 and 5"],
-			args_example = [5],
-			result_desc = "The type of logger module used",
-			result_example = lager,
 			args = [{loglevel, integer}],
 			result = {logger, atom}},
 
@@ -158,49 +120,35 @@ get_commands_spec() ->
 			desc = "List modified modules that can be updated",
 			module = ?MODULE, function = update_list,
 			args = [],
-			result_example = ["mod_configure", "mod_vcard"],
 			result = {modules, {list, {module, string}}}},
      #ejabberd_commands{name = update, tags = [server],
 			desc = "Update the given module, or use the keyword: all",
 			module = ?MODULE, function = update,
-			args_example = ["mod_vcard"],
 			args = [{module, string}],
 			result = {res, restuple}},
 
      #ejabberd_commands{name = register, tags = [accounts],
 			desc = "Register a user",
-			policy = admin,
 			module = ?MODULE, function = register,
-			args_desc = ["Username", "Local vhost served by ejabberd", "Password"],
-			args_example = [<<"bob">>, <<"example.com">>, <<"SomEPass44">>],
 			args = [{user, binary}, {host, binary}, {password, binary}],
 			result = {res, restuple}},
      #ejabberd_commands{name = unregister, tags = [accounts],
 			desc = "Unregister a user",
-                        policy = admin,
 			module = ?MODULE, function = unregister,
-			args_desc = ["Username", "Local vhost served by ejabberd"],
-			args_example = [<<"bob">>, <<"example.com">>],
 			args = [{user, binary}, {host, binary}],
 			result = {res, restuple}},
      #ejabberd_commands{name = registered_users, tags = [accounts],
 			desc = "List all registered users in HOST",
 			module = ?MODULE, function = registered_users,
-			args_desc = ["Local vhost"],
-			args_example = [<<"example.com">>],
-			result_desc = "List of registered accounts usernames",
-			result_example = [<<"user1">>, <<"user2">>],
 			args = [{host, binary}],
 			result = {users, {list, {username, string}}}},
 	 #ejabberd_commands{name = registered_vhosts, tags = [server],
 			desc = "List all registered vhosts in SERVER",
 			module = ?MODULE, function = registered_vhosts,
-			result_desc = "List of available vhosts",
-			result_example = [<<"example.com">>, <<"anon.example.com">>],
 			args = [],
 			result = {vhosts, {list, {vhost, string}}}},
      #ejabberd_commands{name = reload_config, tags = [server],
-			desc = "Reload config file in memory",
+			desc = "Reload config file in memory (only affects ACL and Access)",
 			module = ?MODULE, function = reload_config,
 			args = [],
 			result = {res, rescode}},
@@ -208,85 +156,63 @@ get_commands_spec() ->
      #ejabberd_commands{name = join_cluster, tags = [cluster],
 			desc = "Join this node into the cluster handled by Node",
 			module = ?MODULE, function = join_cluster,
-			args_desc = ["Nodename of the node to join"],
-			args_example = [<<"ejabberd1@machine7">>],
 			args = [{node, binary}],
 			result = {res, rescode}},
      #ejabberd_commands{name = leave_cluster, tags = [cluster],
-			desc = "Remove and shutdown Node from the running cluster",
-			longdesc = "This command can be run from any running node of the cluster, "
-			    "even the node to be removed.",
+			desc = "Remove node handled by Node from the cluster",
 			module = ?MODULE, function = leave_cluster,
-			args_desc = ["Nodename of the node to kick from the cluster"],
-			args_example = [<<"ejabberd1@machine8">>],
 			args = [{node, binary}],
 			result = {res, rescode}},
-
      #ejabberd_commands{name = list_cluster, tags = [cluster],
 			desc = "List nodes that are part of the cluster handled by Node",
 			module = ?MODULE, function = list_cluster,
-			result_example = [ejabberd1@machine7, ejabberd1@machine8],
-			args = [],
+			args = [], 
 			result = {nodes, {list, {node, atom}}}},
 
      #ejabberd_commands{name = import_file, tags = [mnesia],
 			desc = "Import user data from jabberd14 spool file",
 			module = ?MODULE, function = import_file,
-			args_desc = ["Full path to the jabberd14 spool file"],
-			args_example = ["/var/lib/ejabberd/jabberd14.spool"],
 			args = [{file, string}], result = {res, restuple}},
      #ejabberd_commands{name = import_dir, tags = [mnesia],
 			desc = "Import users data from jabberd14 spool dir",
 			module = ?MODULE, function = import_dir,
-			args_desc = ["Full path to the jabberd14 spool directory"],
-			args_example = ["/var/lib/ejabberd/jabberd14/"],
 			args = [{file, string}],
 			result = {res, restuple}},
 
      #ejabberd_commands{name = import_piefxis, tags = [mnesia],
 			desc = "Import users data from a PIEFXIS file (XEP-0227)",
 			module = ejabberd_piefxis, function = import_file,
-			args_desc = ["Full path to the PIEFXIS file"],
-			args_example = ["/var/lib/ejabberd/example.com.xml"],
 			args = [{file, string}], result = {res, rescode}},
      #ejabberd_commands{name = export_piefxis, tags = [mnesia],
 			desc = "Export data of all users in the server to PIEFXIS files (XEP-0227)",
 			module = ejabberd_piefxis, function = export_server,
-			args_desc = ["Full path to a directory"],
-			args_example = ["/var/lib/ejabberd/"],
 			args = [{dir, string}], result = {res, rescode}},
      #ejabberd_commands{name = export_piefxis_host, tags = [mnesia],
 			desc = "Export data of users in a host to PIEFXIS files (XEP-0227)",
 			module = ejabberd_piefxis, function = export_host,
-			args_desc = ["Full path to a directory", "Vhost to export"],
-			args_example = ["/var/lib/ejabberd/", "example.com"],
 			args = [{dir, string}, {host, string}], result = {res, rescode}},
 
-     #ejabberd_commands{name = delete_mnesia, tags = [mnesia, sql],
-                        desc = "Delete elements in Mnesia database for a given vhost",
-                        module = ejd2sql, function = delete,
-			args_desc = ["Vhost which content will be deleted in Mnesia database"],
-			args_example = ["example.com"],
+     #ejabberd_commands{name = export_odbc, tags = [mnesia, odbc],
+                        desc = "Export all tables as SQL queries to a file",
+                        module = ejd2odbc, function = export,
+                        args = [{host, string}, {file, string}], result = {res, rescode}},
+     #ejabberd_commands{name = delete_mnesia, tags = [mnesia, odbc],
+                        desc = "Export all tables as SQL queries to a file",
+                        module = ejd2odbc, function = delete,
                         args = [{host, string}], result = {res, rescode}},
-     #ejabberd_commands{name = convert_to_scram, tags = [sql],
+     #ejabberd_commands{name = convert_to_scram, tags = [odbc],
 			desc = "Convert the passwords in 'users' ODBC table to SCRAM",
-			module = ejabberd_auth_sql, function = convert_to_scram,
-			args_desc = ["Vhost which users' passwords will be scrammed"],
-			args_example = ["example.com"],
+			module = ejabberd_auth_odbc, function = convert_to_scram,
 			args = [{host, binary}], result = {res, rescode}},
 
-     #ejabberd_commands{name = import_prosody, tags = [mnesia, sql, riak],
+     #ejabberd_commands{name = import_prosody, tags = [mnesia, odbc, riak],
 			desc = "Import data from Prosody",
 			module = prosody2ejabberd, function = from_dir,
-			args_desc = ["Full path to the Prosody data directory"],
-			args_example = ["/var/lib/prosody/datadump/"],
 			args = [{dir, string}], result = {res, rescode}},
 
      #ejabberd_commands{name = convert_to_yaml, tags = [config],
                         desc = "Convert the input file from Erlang to YAML format",
                         module = ejabberd_config, function = convert_to_yaml,
-			args_desc = ["Full path to the original configuration file", "And full path to final file"],
-			args_example = ["/etc/ejabberd/ejabberd.cfg", "/etc/ejabberd/ejabberd.yml"],
                         args = [{in, string}, {out, string}],
                         result = {res, rescode}},
 
@@ -297,75 +223,49 @@ get_commands_spec() ->
      #ejabberd_commands{name = delete_old_messages, tags = [purge],
 			desc = "Delete offline messages older than DAYS",
 			module = ?MODULE, function = delete_old_messages,
-			args_desc = ["Number of days"],
-			args_example = [31],
 			args = [{days, integer}], result = {res, rescode}},
-
-     #ejabberd_commands{name = export2sql, tags = [mnesia],
-			desc = "Export virtual host information from Mnesia tables to SQL file",
-			module = ejd2sql, function = export,
-			args_desc = ["Vhost", "Full path to the destination SQL file"],
-			args_example = ["example.com", "/var/lib/ejabberd/example.com.sql"],
-			args = [{host, string}, {file, string}],
+	 
+     #ejabberd_commands{name = export2odbc, tags = [mnesia],
+			desc = "Export virtual host information from Mnesia tables to SQL files",
+			module = ejd2odbc, function = export,
+			args = [{host, string}, {directory, string}],
 			result = {res, rescode}},
      #ejabberd_commands{name = set_master, tags = [mnesia],
 			desc = "Set master node of the clustered Mnesia tables",
 			longdesc = "If you provide as nodename \"self\", this "
 			"node will be set as its own master.",
 			module = ?MODULE, function = set_master,
-			args_desc = ["Name of the erlang node that will be considered master of this node"],
-			args_example = ["ejabberd@machine7"],
 			args = [{nodename, string}], result = {res, restuple}},
      #ejabberd_commands{name = mnesia_change_nodename, tags = [mnesia],
 			desc = "Change the erlang node name in a backup file",
 			module = ?MODULE, function = mnesia_change_nodename,
-			args_desc = ["Name of the old erlang node", "Name of the new node",
-			    "Path to old backup file", "Path to the new backup file"],
-			args_example = ["ejabberd@machine1", "ejabberd@machine2",
-			    "/var/lib/ejabberd/old.backup", "/var/lib/ejabberd/new.backup"],
 			args = [{oldnodename, string}, {newnodename, string},
 				{oldbackup, string}, {newbackup, string}],
 			result = {res, restuple}},
      #ejabberd_commands{name = backup, tags = [mnesia],
 			desc = "Store the database to backup file",
 			module = ?MODULE, function = backup_mnesia,
-			args_desc = ["Full path for the destination backup file"],
-			args_example = ["/var/lib/ejabberd/database.backup"],
 			args = [{file, string}], result = {res, restuple}},
      #ejabberd_commands{name = restore, tags = [mnesia],
 			desc = "Restore the database from backup file",
 			module = ?MODULE, function = restore_mnesia,
-			args_desc = ["Full path to the backup file"],
-			args_example = ["/var/lib/ejabberd/database.backup"],
 			args = [{file, string}], result = {res, restuple}},
      #ejabberd_commands{name = dump, tags = [mnesia],
-			desc = "Dump the database to a text file",
+			desc = "Dump the database to text file",
 			module = ?MODULE, function = dump_mnesia,
-			args_desc = ["Full path for the text file"],
-			args_example = ["/var/lib/ejabberd/database.txt"],
 			args = [{file, string}], result = {res, restuple}},
      #ejabberd_commands{name = dump_table, tags = [mnesia],
-			desc = "Dump a table to a text file",
+			desc = "Dump a table to text file",
 			module = ?MODULE, function = dump_table,
-			args_desc = ["Full path for the text file", "Table name"],
-			args_example = ["/var/lib/ejabberd/table-muc-registered.txt", "muc_registered"],
 			args = [{file, string}, {table, string}], result = {res, restuple}},
      #ejabberd_commands{name = load, tags = [mnesia],
-			desc = "Restore the database from a text file",
+			desc = "Restore the database from text file",
 			module = ?MODULE, function = load_mnesia,
-			args_desc = ["Full path to the text file"],
-			args_example = ["/var/lib/ejabberd/database.txt"],
 			args = [{file, string}], result = {res, restuple}},
      #ejabberd_commands{name = install_fallback, tags = [mnesia],
 			desc = "Install the database from a fallback file",
 			module = ?MODULE, function = install_fallback_mnesia,
-			args_desc = ["Full path to the fallback file"],
-			args_example = ["/var/lib/ejabberd/database.fallback"],
-			args = [{file, string}], result = {res, restuple}},
-     #ejabberd_commands{name = clear_cache, tags = [server],
-			desc = "Clear database cache on all nodes",
-			module = ?MODULE, function = clear_cache,
-			args = [], result = {res, rescode}}
+			args = [{file, string}], result = {res, restuple}}
     ].
 
 
@@ -404,8 +304,8 @@ set_loglevel(LogLevel) ->
 %%%
 
 stop_kindly(DelaySeconds, AnnouncementTextString) ->
-    Subject = (str:format("Server stop in ~p seconds!", [DelaySeconds])),
-    WaitingDesc = (str:format("Waiting ~p seconds", [DelaySeconds])),
+    Subject = list_to_binary(io_lib:format("Server stop in ~p seconds!", [DelaySeconds])),
+    WaitingDesc = list_to_binary(io_lib:format("Waiting ~p seconds", [DelaySeconds])),
     AnnouncementText = list_to_binary(AnnouncementTextString),
     Steps = [
 	     {"Stopping ejabberd port listeners",
@@ -439,12 +339,13 @@ stop_kindly(DelaySeconds, AnnouncementTextString) ->
     ok.
 
 send_service_message_all_mucs(Subject, AnnouncementText) ->
-    Message = str:format("~s~n~s", [Subject, AnnouncementText]),
+    Message = list_to_binary(
+                io_lib:format("~s~n~s", [Subject, AnnouncementText])),
     lists:foreach(
       fun(ServerHost) ->
 	      MUCHost = gen_mod:get_module_opt_host(
 			  ServerHost, mod_muc, <<"conference.@HOST@">>),
-	      mod_muc:broadcast_service_message(ServerHost, MUCHost, Message)
+	      mod_muc:broadcast_service_message(MUCHost, Message)
       end,
       ?MYHOSTS).
 
@@ -478,15 +379,16 @@ update_module(ModuleNameString) ->
 
 register(User, Host, Password) ->
     case ejabberd_auth:try_register(User, Host, Password) of
-	ok ->
+	{atomic, ok} ->
 	    {ok, io_lib:format("User ~s@~s successfully registered", [User, Host])};
-	{error, exists} ->
-	    Msg = io_lib:format("User ~s@~s already registered", [User, Host]),
-	    {error, conflict, 10090, Msg};
+	{atomic, exists} ->
+	    String = io_lib:format("User ~s@~s already registered at node ~p",
+				   [User, Host, node()]),
+	    {exists, String};
 	{error, Reason} ->
 	    String = io_lib:format("Can't register user ~s@~s at node ~p: ~p",
 				   [User, Host, node(), Reason]),
-	    {error, cannot_register, 10001, String}
+	    {cannot_register, String}
     end.
 
 unregister(User, Host) ->
@@ -494,7 +396,7 @@ unregister(User, Host) ->
     {ok, ""}.
 
 registered_users(Host) ->
-    Users = ejabberd_auth:get_users(Host),
+    Users = ejabberd_auth:get_vh_registered_users(Host),
     SUsers = lists:sort(Users),
     lists:map(fun({U, _S}) -> U end, SUsers).
 
@@ -502,7 +404,9 @@ registered_vhosts() ->
 	?MYHOSTS.
 
 reload_config() ->
-    ejabberd_config:reload_file().
+    ejabberd_config:reload_file(),
+    acl:start(),
+    shaper:start().
 
 %%%
 %%% Cluster management
@@ -616,7 +520,7 @@ restore(Path) ->
 %% Obsolete tables or tables created by module who are no longer used are not
 %% restored and are ignored.
 keep_tables() ->
-    lists:flatten([acl, passwd, config,
+    lists:flatten([acl, passwd, config, local_config,
 		   keep_modules_tables()]).
 
 %% Returns the list of modules tables in use, according to the list of actually
@@ -764,7 +668,3 @@ mnesia_change_nodename(FromString, ToString, Source, Target) ->
 		{[Other], Acc}
 	end,
     mnesia:traverse_backup(Source, Target, Convert, switched).
-
-clear_cache() ->
-    Nodes = ejabberd_cluster:get_nodes(),
-    lists:foreach(fun(T) -> ets_cache:clear(T, Nodes) end, ets_cache:all()).

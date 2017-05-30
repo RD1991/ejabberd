@@ -5,7 +5,7 @@
 %%% Created :  7 Dec 2002 by Alexey Shchepin <alexey@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2016   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -34,18 +34,16 @@
 -behaviour(gen_server).
 
 %% API
--export([start_link/0, route/1, have_connection/1,
-	 get_connections_pids/1, try_register/1,
-	 remove_connection/2, start_connection/2, start_connection/3,
+-export([start_link/0, route/3, have_connection/1,
+	 make_key/2, get_connections_pids/1, try_register/1,
+	 remove_connection/2, find_connection/2,
 	 dirty_get_connections/0, allow_host/2,
 	 incoming_s2s_number/0, outgoing_s2s_number/0,
-	 stop_all_connections/0,
 	 clean_temporarily_blocked_table/0,
 	 list_temporarily_blocked_hosts/0,
 	 external_host_overloaded/1, is_temporarly_blocked/1,
-	 get_commands_spec/0, zlib_enabled/1, get_idle_timeout/1,
-	 tls_required/1, tls_verify/1, tls_enabled/1, tls_options/2,
-	 host_up/1, host_down/1, queue_type/1]).
+	 check_peer_certificate/3,
+	 get_commands_spec/0]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2,
@@ -57,7 +55,7 @@
 -include("ejabberd.hrl").
 -include("logger.hrl").
 
--include("xmpp.hrl").
+-include("jlib.hrl").
 
 -include("ejabberd_commands.hrl").
 
@@ -91,13 +89,14 @@ start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [],
 			  []).
 
--spec route(stanza()) -> ok.
+-spec route(jid(), jid(), xmlel()) -> ok.
 
-route(Packet) ->
-    try do_route(Packet)
-    catch E:R ->
-            ?ERROR_MSG("failed to route packet:~n~s~nReason = ~p",
-                       [xmpp:pp(Packet), {E, {R, erlang:get_stacktrace()}}])
+route(From, To, Packet) ->
+    case catch do_route(From, To, Packet) of
+      {'EXIT', Reason} ->
+	  ?ERROR_MSG("~p~nwhen processing: ~p",
+		     [Reason, {From, To, Packet}]);
+      _ -> ok
     end.
 
 clean_temporarily_blocked_table() ->
@@ -196,78 +195,38 @@ try_register(FromTo) ->
 dirty_get_connections() ->
     mnesia:dirty_all_keys(s2s).
 
--spec tls_options(binary(), [proplists:property()]) -> [proplists:property()].
-tls_options(LServer, DefaultOpts) ->
-    TLSOpts1 = case ejabberd_config:get_option(
-		      {s2s_certfile, LServer},
-		      ejabberd_config:get_option(
-			{domain_certfile, LServer})) of
-		   undefined -> DefaultOpts;
-		   CertFile -> lists:keystore(certfile, 1, DefaultOpts,
-					      {certfile, CertFile})
-	       end,
-    TLSOpts2 = case ejabberd_config:get_option(
-		      {s2s_ciphers, LServer}) of
-                   undefined -> TLSOpts1;
-                   Ciphers -> lists:keystore(ciphers, 1, TLSOpts1,
-					     {ciphers, Ciphers})
-               end,
-    TLSOpts3 = case ejabberd_config:get_option(
-                      {s2s_protocol_options, LServer}) of
-                   undefined -> TLSOpts2;
-                   ProtoOpts -> lists:keystore(protocol_options, 1, TLSOpts2,
-					       {protocol_options, ProtoOpts})
-               end,
-    TLSOpts4 = case ejabberd_config:get_option(
-		      {s2s_dhfile, LServer}) of
-                   undefined -> TLSOpts3;
-                   DHFile -> lists:keystore(dhfile, 1, TLSOpts3,
-					    {dhfile, DHFile})
-               end,
-    TLSOpts5 = case ejabberd_config:get_option(
-		      {s2s_cafile, LServer}) of
-		   undefined -> TLSOpts4;
-		   CAFile -> lists:keystore(cafile, 1, TLSOpts4,
-					    {cafile, CAFile})
-	       end,
-    case ejabberd_config:get_option({s2s_tls_compression, LServer}) of
-	undefined -> TLSOpts5;
-	false -> [compression_none | TLSOpts5];
-	true -> lists:delete(compression_none, TLSOpts5)
+check_peer_certificate(SockMod, Sock, Peer) ->
+    case SockMod:get_peer_certificate(Sock) of
+      {ok, Cert} ->
+	  case SockMod:get_verify_result(Sock) of
+	    0 ->
+		case ejabberd_idna:domain_utf8_to_ascii(Peer) of
+		  false ->
+		      {error, <<"Cannot decode remote server name">>};
+		  AsciiPeer ->
+		      case
+			lists:any(fun(D) -> match_domain(AsciiPeer, D) end,
+				  get_cert_domains(Cert)) of
+			true ->
+			    {ok, <<"Verification successful">>};
+			false ->
+			    {error, <<"Certificate host name mismatch">>}
+		      end
+		end;
+	    VerifyRes ->
+		{error, fast_tls:get_cert_verify_string(VerifyRes, Cert)}
+	  end;
+      {error, _Reason} ->
+	    {error, <<"Cannot get peer certificate">>};
+      error ->
+	    {error, <<"Cannot get peer certificate">>}
     end.
 
--spec tls_required(binary()) -> boolean().
-tls_required(LServer) ->
-    TLS = use_starttls(LServer),
-    TLS == required orelse TLS == required_trusted.
-
--spec tls_verify(binary()) -> boolean().
-tls_verify(LServer) ->
-    TLS = use_starttls(LServer),
-    TLS == required_trusted.
-
--spec tls_enabled(binary()) -> boolean().
-tls_enabled(LServer) ->
-    TLS = use_starttls(LServer),
-    TLS /= false.
-
--spec zlib_enabled(binary()) -> boolean().
-zlib_enabled(LServer) ->
-    ejabberd_config:get_option({s2s_zlib, LServer}, false).
-
--spec use_starttls(binary()) -> boolean() | optional | required | required_trusted.
-use_starttls(LServer) ->
-    ejabberd_config:get_option({s2s_use_starttls, LServer}, false).
-
--spec get_idle_timeout(binary()) -> non_neg_integer() | infinity.
-get_idle_timeout(LServer) ->
-    ejabberd_config:get_option({s2s_timeout, LServer}, timer:minutes(10)).
-
--spec queue_type(binary()) -> ram | file.
-queue_type(LServer) ->
-    ejabberd_config:get_option(
-      {s2s_queue_type, LServer},
-      ejabberd_config:default_queue_type(LServer)).
+make_key({From, To}, StreamID) ->
+    Secret = ejabberd_config:get_option(shared_key, fun(V) -> V end),
+    p1_sha:to_hexlist(
+      crypto:hmac(sha256, p1_sha:to_hexlist(crypto:hash(sha256, Secret)),
+		  [To, " ", From, " ", StreamID])).
 
 %%====================================================================
 %% gen_server callbacks
@@ -275,18 +234,16 @@ queue_type(LServer) ->
 
 init([]) ->
     update_tables(),
-    ejabberd_mnesia:create(?MODULE, s2s,
+    mnesia:create_table(s2s,
 			[{ram_copies, [node()]},
 			 {type, bag},
 			 {attributes, record_info(fields, s2s)}]),
+    mnesia:add_table_copy(s2s, node(), ram_copies),
     mnesia:subscribe(system),
     ejabberd_commands:register_commands(get_commands_spec()),
-    ejabberd_mnesia:create(?MODULE, temporarily_blocked,
+    mnesia:create_table(temporarily_blocked,
 			[{ram_copies, [node()]},
 			 {attributes, record_info(fields, temporarily_blocked)}]),
-    ejabberd_hooks:add(host_up, ?MODULE, host_up, 50),
-    ejabberd_hooks:add(host_down, ?MODULE, host_down, 60),
-    lists:foreach(fun host_up/1, ?MYHOSTS),
     {ok, #state{}}.
 
 handle_call(_Request, _From, State) ->
@@ -298,16 +255,18 @@ handle_cast(_Msg, State) ->
 handle_info({mnesia_system_event, {mnesia_down, Node}}, State) ->
     clean_table_from_bad_node(Node),
     {noreply, State};
-handle_info({route, Packet}, State) ->
-    route(Packet),
+handle_info({route, From, To, Packet}, State) ->
+    case catch do_route(From, To, Packet) of
+      {'EXIT', Reason} ->
+	  ?ERROR_MSG("~p~nwhen processing: ~p",
+		     [Reason, {From, To, Packet}]);
+      _ -> ok
+    end,
     {noreply, State};
 handle_info(_Info, State) -> {noreply, State}.
 
 terminate(_Reason, _State) ->
     ejabberd_commands:unregister_commands(get_commands_spec()),
-    lists:foreach(fun host_down/1, ?MYHOSTS),
-    ejabberd_hooks:delete(host_up, ?MODULE, host_up, 50),
-    ejabberd_hooks:delete(host_down, ?MODULE, host_down, 60),
     ok.
 
 code_change(_OldVsn, State, _Extra) ->
@@ -316,27 +275,7 @@ code_change(_OldVsn, State, _Extra) ->
 %%--------------------------------------------------------------------
 %%% Internal functions
 %%--------------------------------------------------------------------
-host_up(Host) ->
-    ejabberd_s2s_in:host_up(Host),
-    ejabberd_s2s_out:host_up(Host).
 
-host_down(Host) ->
-    lists:foreach(
-      fun(#s2s{fromto = {From, _}, pid = Pid}) when node(Pid) == node() ->
-	      case ejabberd_router:host_of_route(From) of
-		  Host ->
-		      ejabberd_s2s_out:send(Pid, xmpp:serr_system_shutdown()),
-		      ejabberd_s2s_out:stop(Pid);
-		  _ ->
-		      ok
-	      end;
-	 (_) ->
-	      ok
-      end, ets:tab2list(s2s)),
-    ejabberd_s2s_in:host_down(Host),
-    ejabberd_s2s_out:host_down(Host).
-
--spec clean_table_from_bad_node(node()) -> any().
 clean_table_from_bad_node(Node) ->
     F = fun() ->
 		Es = mnesia:select(
@@ -350,40 +289,39 @@ clean_table_from_bad_node(Node) ->
 	end,
     mnesia:async_dirty(F).
 
--spec do_route(stanza()) -> ok.
-do_route(Packet) ->
-    ?DEBUG("local route:~n~s", [xmpp:pp(Packet)]),
-    From = xmpp:get_from(Packet),
-    To = xmpp:get_to(Packet),
-    case start_connection(From, To) of
-	{ok, Pid} when is_pid(Pid) ->
+do_route(From, To, Packet) ->
+    ?DEBUG("s2s manager~n\tfrom ~p~n\tto ~p~n\tpacket "
+	   "~P~n",
+	   [From, To, Packet, 8]),
+    case find_connection(From, To) of
+      {atomic, Pid} when is_pid(Pid) ->
 	  ?DEBUG("sending to process ~p~n", [Pid]),
+	  #xmlel{name = Name, attrs = Attrs, children = Els} =
+	      Packet,
+	  NewAttrs =
+	      jlib:replace_from_to_attrs(jid:to_string(From),
+					 jid:to_string(To), Attrs),
 	  #jid{lserver = MyServer} = From,
-	    ejabberd_hooks:run(s2s_send_packet, MyServer, [Packet]),
-	    ejabberd_s2s_out:route(Pid, Packet);
-	{error, Reason} ->
-	  Lang = xmpp:get_lang(Packet),
-	    Err = case Reason of
-		      policy_violation ->
-			  xmpp:err_policy_violation(
-			    <<"Server connections to local "
-			      "subdomains are forbidden">>, Lang);
-		      forbidden ->
-			  xmpp:err_forbidden(<<"Denied by ACL">>, Lang);
-		      internal_server_error ->
-			  xmpp:err_internal_server_error()
-		  end,
-	    ejabberd_router:route_error(Packet, Err)
+	  ejabberd_hooks:run(s2s_send_packet, MyServer,
+			     [From, To, Packet]),
+	  send_element(Pid,
+		       #xmlel{name = Name, attrs = NewAttrs, children = Els}),
+	  ok;
+      {aborted, _Reason} ->
+	  case fxml:get_tag_attr_s(<<"type">>, Packet) of
+	    <<"error">> -> ok;
+	    <<"result">> -> ok;
+	    _ ->
+		Err = jlib:make_error_reply(Packet,
+					    ?ERR_SERVICE_UNAVAILABLE),
+		ejabberd_router:route(To, From, Err)
+	  end,
+	  false
     end.
 
--spec start_connection(jid(), jid())
-      -> {ok, pid()} | {error, policy_violation | forbidden | internal_server_error}.
-start_connection(From, To) ->
-    start_connection(From, To, []).
+-spec find_connection(jid(), jid()) -> {aborted, any()} | {atomic, pid()}.
 
--spec start_connection(jid(), jid(), [proplists:property()])
-      -> {ok, pid()} | {error, policy_violation | forbidden | internal_server_error}.
-start_connection(From, To, Opts) ->
+find_connection(From, To) ->
     #jid{lserver = MyServer} = From,
     #jid{lserver = Server} = To,
     FromTo = {MyServer, Server},
@@ -392,29 +330,24 @@ start_connection(From, To, Opts) ->
     MaxS2SConnectionsNumberPerNode =
 	max_s2s_connections_number_per_node(FromTo),
     ?DEBUG("Finding connection for ~p~n", [FromTo]),
-    case mnesia:dirty_read(s2s, FromTo) of
+    case catch mnesia:dirty_read(s2s, FromTo) of
+      {'EXIT', Reason} -> {aborted, Reason};
       [] ->
 	  %% We try to establish all the connections if the host is not a
 	  %% service and if the s2s host is not blacklisted or
 	  %% is in whitelist:
-	  LServer = ejabberd_router:host_of_route(MyServer),
-	  case is_service(From, To) of
+	  case not is_service(From, To) andalso
+		 allow_host(MyServer, Server)
+	      of
 	    true ->
-		  {error, policy_violation};
-	      false ->
-		  case allow_host(LServer, Server) of
-		      true ->
-			  NeededConnections = needed_connections_number(
-						[],
+		NeededConnections = needed_connections_number([],
 							      MaxS2SConnectionsNumber,
 							      MaxS2SConnectionsNumberPerNode),
 		open_several_connections(NeededConnections, MyServer,
 					 Server, From, FromTo,
 					 MaxS2SConnectionsNumber,
-						   MaxS2SConnectionsNumberPerNode, Opts);
-		      false ->
-			  {error, forbidden}
-		  end
+					 MaxS2SConnectionsNumberPerNode);
+	    false -> {aborted, error}
 	  end;
       L when is_list(L) ->
 	  NeededConnections = needed_connections_number(L,
@@ -425,18 +358,16 @@ start_connection(From, To, Opts) ->
 		 open_several_connections(NeededConnections, MyServer,
 					  Server, From, FromTo,
 					  MaxS2SConnectionsNumber,
-					  MaxS2SConnectionsNumberPerNode, Opts);
+					  MaxS2SConnectionsNumberPerNode);
 	     true ->
 		 %% We choose a connexion from the pool of opened ones.
-		 {ok, choose_connection(From, L)}
+		 {atomic, choose_connection(From, L)}
 	  end
     end.
 
--spec choose_connection(jid(), [#s2s{}]) -> pid().
 choose_connection(From, Connections) ->
     choose_pid(From, [C#s2s.pid || C <- Connections]).
 
--spec choose_pid(jid(), [pid()]) -> pid().
 choose_pid(From, Pids) ->
     Pids1 = case [P || P <- Pids, node(P) == node()] of
 	      [] -> Pids;
@@ -451,22 +382,20 @@ choose_pid(From, Pids) ->
 
 open_several_connections(N, MyServer, Server, From,
 			 FromTo, MaxS2SConnectionsNumber,
-			 MaxS2SConnectionsNumberPerNode, Opts) ->
-    case lists:flatmap(
-	   fun(_) ->
-		   new_connection(MyServer, Server,
+			 MaxS2SConnectionsNumberPerNode) ->
+    ConnectionsResult = [new_connection(MyServer, Server,
 					From, FromTo, MaxS2SConnectionsNumber,
-				  MaxS2SConnectionsNumberPerNode, Opts)
-	   end, lists:seq(1, N)) of
-	[] ->
-	    {error, internal_server_error};
-	PIDs ->
-	    {ok, choose_pid(From, PIDs)}
+					MaxS2SConnectionsNumberPerNode)
+			 || _N <- lists:seq(1, N)],
+    case [PID || {atomic, PID} <- ConnectionsResult] of
+      [] -> hd(ConnectionsResult);
+      PIDs -> {atomic, choose_pid(From, PIDs)}
     end.
 
 new_connection(MyServer, Server, From, FromTo,
-	       MaxS2SConnectionsNumber, MaxS2SConnectionsNumberPerNode, Opts) ->
-    {ok, Pid} = ejabberd_s2s_out:start(MyServer, Server, Opts),
+	       MaxS2SConnectionsNumber, MaxS2SConnectionsNumberPerNode) ->
+    {ok, Pid} = ejabberd_s2s_out:start(
+		  MyServer, Server, new),
     F = fun() ->
 		L = mnesia:read({s2s, FromTo}),
 		NeededConnections = needed_connections_number(L,
@@ -474,41 +403,34 @@ new_connection(MyServer, Server, From, FromTo,
 							      MaxS2SConnectionsNumberPerNode),
 		if NeededConnections > 0 ->
 		       mnesia:write(#s2s{fromto = FromTo, pid = Pid}),
+		       ?INFO_MSG("New s2s connection started ~p", [Pid]),
 		       Pid;
 		   true -> choose_connection(From, L)
 		end
 	end,
     TRes = mnesia:transaction(F),
     case TRes of
-      {atomic, Pid1} ->
-	    if Pid1 == Pid ->
-		    ejabberd_s2s_out:connect(Pid);
-	       true ->
-		    ejabberd_s2s_out:stop(Pid)
-	    end,
-	    [Pid1];
-      {aborted, Reason} ->
-	    ?ERROR_MSG("failed to register connection ~s -> ~s: ~p",
-		       [MyServer, Server, Reason]),
-	    ejabberd_s2s_out:stop(Pid),
-	    []
-    end.
+      {atomic, Pid} -> ejabberd_s2s_out:start_connection(Pid);
+      _ -> ejabberd_s2s_out:stop_connection(Pid)
+    end,
+    TRes.
 
--spec max_s2s_connections_number({binary(), binary()}) -> integer().
 max_s2s_connections_number({From, To}) ->
-    case acl:match_rule(From, max_s2s_connections, jid:make(To)) of
+    case acl:match_rule(From, max_s2s_connections,
+			jid:make(<<"">>, To, <<"">>))
+	of
       Max when is_integer(Max) -> Max;
       _ -> ?DEFAULT_MAX_S2S_CONNECTIONS_NUMBER
     end.
 
--spec max_s2s_connections_number_per_node({binary(), binary()}) -> integer().
 max_s2s_connections_number_per_node({From, To}) ->
-    case acl:match_rule(From, max_s2s_connections_per_node, jid:make(To)) of
+    case acl:match_rule(From, max_s2s_connections_per_node,
+			jid:make(<<"">>, To, <<"">>))
+	of
       Max when is_integer(Max) -> Max;
       _ -> ?DEFAULT_MAX_S2S_CONNECTIONS_NUMBER_PER_NODE
     end.
 
--spec needed_connections_number([#s2s{}], integer(), integer()) -> integer().
 needed_connections_number(Ls, MaxS2SConnectionsNumber,
 			  MaxS2SConnectionsNumberPerNode) ->
     LocalLs = [L || L <- Ls, node(L#s2s.pid) == node()],
@@ -520,10 +442,11 @@ needed_connections_number(Ls, MaxS2SConnectionsNumber,
 %% Description: Return true if the destination must be considered as a
 %% service.
 %% --------------------------------------------------------------------
--spec is_service(jid(), jid()) -> boolean().
 is_service(From, To) ->
     LFromDomain = From#jid.lserver,
-    case ejabberd_config:get_option({route_subdomains, LFromDomain}, local) of
+    case ejabberd_config:get_option(
+           {route_subdomains, LFromDomain},
+           fun(s2s) -> s2s; (local) -> local end, local) of
       s2s -> % bypass RFC 3920 10.3
 	  false;
       local ->
@@ -541,57 +464,35 @@ parent_domains(Domain) ->
 		end,
 		[], lists:reverse(str:tokens(Domain, <<".">>))).
 
+send_element(Pid, El) ->
+    Pid ! {send_element, El}.
+
 %%%----------------------------------------------------------------------
 %%% ejabberd commands
 
 get_commands_spec() ->
-    [#ejabberd_commands{
-        name = incoming_s2s_number,
+    [#ejabberd_commands{name = incoming_s2s_number,
 			tags = [stats, s2s],
-        desc = "Number of incoming s2s connections on the node",
+			desc =
+			    "Number of incoming s2s connections on "
+			    "the node",
                         policy = admin,
 			module = ?MODULE, function = incoming_s2s_number,
 			args = [], result = {s2s_incoming, integer}},
-     #ejabberd_commands{
-        name = outgoing_s2s_number,
+     #ejabberd_commands{name = outgoing_s2s_number,
 			tags = [stats, s2s],
-        desc = "Number of outgoing s2s connections on the node",
+			desc =
+			    "Number of outgoing s2s connections on "
+			    "the node",
                         policy = admin,
 			module = ?MODULE, function = outgoing_s2s_number,
-			args = [], result = {s2s_outgoing, integer}},
-     #ejabberd_commands{name = stop_all_connections,
-			tags = [s2s],
-			desc = "Stop all outgoing and incoming connections",
-			policy = admin,
-			module = ?MODULE, function = stop_all_connections,
-			args = [], result = {res, rescode}}].
+			args = [], result = {s2s_outgoing, integer}}].
 
-%% TODO Move those stats commands to ejabberd stats command ?
 incoming_s2s_number() ->
-    supervisor_count(ejabberd_s2s_in_sup).
+    length(supervisor:which_children(ejabberd_s2s_in_sup)).
 
 outgoing_s2s_number() ->
-    supervisor_count(ejabberd_s2s_out_sup).
-
-supervisor_count(Supervisor) ->
-    case catch supervisor:which_children(Supervisor) of
-        {'EXIT', _} -> 0;
-        Result ->
-            length(Result)
-    end.
-
--spec stop_all_connections() -> ok.
-stop_all_connections() ->
-    lists:foreach(
-      fun({_Id, Pid, _Type, _Module}) ->
-	      supervisor:terminate_child(ejabberd_s2s_in_sup, Pid)
-      end, supervisor:which_children(ejabberd_s2s_in_sup)),
-    lists:foreach(
-      fun({_Id, Pid, _Type, _Module}) ->
-	      supervisor:terminate_child(ejabberd_s2s_out_sup, Pid)
-      end, supervisor:which_children(ejabberd_s2s_out_sup)),
-    mnesia:clear_table(s2s),
-    ok.
+    length(supervisor:which_children(ejabberd_s2s_out_sup)).
 
 %%%----------------------------------------------------------------------
 %%% Update Mnesia tables
@@ -619,12 +520,26 @@ update_tables() ->
 
 %% Check if host is in blacklist or white list
 allow_host(MyServer, S2SHost) ->
-    allow_host1(MyServer, S2SHost) andalso
+    allow_host2(MyServer, S2SHost) andalso
       not is_temporarly_blocked(S2SHost).
 
+allow_host2(MyServer, S2SHost) ->
+    Hosts = (?MYHOSTS),
+    case lists:dropwhile(fun (ParentDomain) ->
+				 not lists:member(ParentDomain, Hosts)
+			 end,
+			 parent_domains(MyServer))
+	of
+      [MyHost | _] -> allow_host1(MyHost, S2SHost);
+      [] -> allow_host1(MyServer, S2SHost)
+    end.
+
 allow_host1(MyHost, S2SHost) ->
-    Rule = ejabberd_config:get_option({s2s_access, MyHost}, all),
-    JID = jid:make(S2SHost),
+    Rule = ejabberd_config:get_option(
+             s2s_access,
+             fun(A) when is_atom(A) -> A end,
+             all),
+    JID = jid:make(<<"">>, S2SHost, <<"">>),
     case acl:match_rule(MyHost, Rule, JID) of
         deny -> false;
         allow ->
@@ -643,7 +558,7 @@ transform_options({{s2s_host, Host}, Action}, Opts) ->
     ?WARNING_MSG("Option 's2s_host' is deprecated. "
                  "The option is still supported but it is better to "
                  "fix your config: use access rules instead.", []),
-    ACLName = misc:binary_to_atom(
+    ACLName = jlib:binary_to_atom(
                 iolist_to_binary(["s2s_access_", Host])),
     [{acl, ACLName, {server, Host}},
      {access, s2s, [{Action, ACLName}]},
@@ -693,53 +608,133 @@ get_s2s_state(S2sPid) ->
 	    end,
     [{s2s_pid, S2sPid} | Infos].
 
--type use_starttls() :: boolean() | optional | required | required_trusted.
--spec opt_type(route_subdomains) -> fun((s2s | local) -> s2s | local);
-	      (s2s_access) -> fun((any()) -> any());
-	      (s2s_certfile) -> fun((binary()) -> binary());
-	      (s2s_ciphers) -> fun((binary()) -> binary());
-	      (s2s_dhfile) -> fun((binary()) -> binary());
-	      (s2s_cafile) -> fun((binary()) -> binary());
-	      (s2s_protocol_options) -> fun(([binary()]) -> binary());
-	      (s2s_tls_compression) -> fun((boolean()) -> boolean());
-	      (s2s_use_starttls) -> fun((use_starttls()) -> use_starttls());
-	      (s2s_zlib) -> fun((boolean()) -> boolean());
-	      (s2s_timeout) -> fun((timeout()) -> timeout());
-	      (s2s_queue_type) -> fun((ram | file) -> ram | file);
-	      (atom()) -> [atom()].
+get_cert_domains(Cert) ->
+    TBSCert = Cert#'Certificate'.tbsCertificate,
+    Subject = case TBSCert#'TBSCertificate'.subject of
+		  {rdnSequence, Subj} -> lists:flatten(Subj);
+		  _ -> []
+	      end,
+    Extensions = case TBSCert#'TBSCertificate'.extensions of
+		     Exts when is_list(Exts) -> Exts;
+		     _ -> []
+		 end,
+    lists:flatmap(fun (#'AttributeTypeAndValue'{type =
+						    ?'id-at-commonName',
+						value = Val}) ->
+			  case 'OTP-PUB-KEY':decode('X520CommonName', Val) of
+			    {ok, {_, D1}} ->
+				D = if is_binary(D1) -> D1;
+				       is_list(D1) -> list_to_binary(D1);
+				       true -> error
+				    end,
+				if D /= error ->
+				       case jid:from_string(D) of
+					 #jid{luser = <<"">>, lserver = LD,
+					      lresource = <<"">>} ->
+					     [LD];
+					 _ -> []
+				       end;
+				   true -> []
+				end;
+			    _ -> []
+			  end;
+		      (_) -> []
+		  end,
+		  Subject)
+      ++
+      lists:flatmap(fun (#'Extension'{extnID =
+					  ?'id-ce-subjectAltName',
+				      extnValue = Val}) ->
+			    BVal = if is_list(Val) -> list_to_binary(Val);
+				      true -> Val
+				   end,
+			    case 'OTP-PUB-KEY':decode('SubjectAltName', BVal)
+				of
+			      {ok, SANs} ->
+				  lists:flatmap(fun ({otherName,
+						      #'AnotherName'{'type-id' =
+									 ?'id-on-xmppAddr',
+								     value =
+									 XmppAddr}}) ->
+							case
+							  'XmppAddr':decode('XmppAddr',
+									    XmppAddr)
+							    of
+							  {ok, D}
+							      when
+								is_binary(D) ->
+							      case
+								jid:from_string((D))
+								  of
+								#jid{luser =
+									 <<"">>,
+								     lserver =
+									 LD,
+								     lresource =
+									 <<"">>} ->
+								    case
+								      ejabberd_idna:domain_utf8_to_ascii(LD)
+									of
+								      false ->
+									  [];
+								      PCLD ->
+									  [PCLD]
+								    end;
+								_ -> []
+							      end;
+							  _ -> []
+							end;
+						    ({dNSName, D})
+							when is_list(D) ->
+							case
+							  jid:from_string(list_to_binary(D))
+							    of
+							  #jid{luser = <<"">>,
+							       lserver = LD,
+							       lresource =
+								   <<"">>} ->
+							      [LD];
+							  _ -> []
+							end;
+						    (_) -> []
+						end,
+						SANs);
+			      _ -> []
+			    end;
+			(_) -> []
+		    end,
+		    Extensions).
+
+match_domain(Domain, Domain) -> true;
+match_domain(Domain, Pattern) ->
+    DLabels = str:tokens(Domain, <<".">>),
+    PLabels = str:tokens(Pattern, <<".">>),
+    match_labels(DLabels, PLabels).
+
+match_labels([], []) -> true;
+match_labels([], [_ | _]) -> false;
+match_labels([_ | _], []) -> false;
+match_labels([DL | DLabels], [PL | PLabels]) ->
+    case lists:all(fun (C) ->
+			   $a =< C andalso C =< $z orelse
+			     $0 =< C andalso C =< $9 orelse
+			       C == $- orelse C == $*
+		   end,
+		   binary_to_list(PL))
+	of
+      true ->
+	  Regexp = ejabberd_regexp:sh_to_awk(PL),
+	  case ejabberd_regexp:run(DL, Regexp) of
+	    match -> match_labels(DLabels, PLabels);
+	    nomatch -> false
+	  end;
+      false -> false
+    end.
+
 opt_type(route_subdomains) ->
     fun (s2s) -> s2s;
 	(local) -> local
     end;
 opt_type(s2s_access) ->
-    fun acl:access_rules_validator/1;
-opt_type(s2s_certfile) -> fun misc:try_read_file/1;
-opt_type(s2s_ciphers) -> fun iolist_to_binary/1;
-opt_type(s2s_dhfile) -> fun misc:try_read_file/1;
-opt_type(s2s_cafile) -> fun misc:try_read_file/1;
-opt_type(s2s_protocol_options) ->
-    fun (Options) -> str:join(Options, <<"|">>) end;
-opt_type(s2s_tls_compression) ->
-    fun (true) -> true;
-	(false) -> false
-    end;
-opt_type(s2s_use_starttls) ->
-    fun (true) -> true;
-	(false) -> false;
-	(optional) -> optional;
-	(required) -> required;
-	(required_trusted) -> required_trusted
-    end;
-opt_type(s2s_zlib) ->
-    fun(B) when is_boolean(B) -> B end;
-opt_type(s2s_timeout) ->
-    fun(I) when is_integer(I), I >= 0 -> timer:seconds(I);
-       (infinity) -> infinity;
-       (unlimited) -> infinity
-    end;
-opt_type(s2s_queue_type) ->
-    fun(ram) -> ram; (file) -> file end;
-opt_type(_) ->
-    [route_subdomains, s2s_access,  s2s_certfile, s2s_zlib,
-     s2s_ciphers, s2s_dhfile, s2s_cafile, s2s_protocol_options,
-     s2s_tls_compression, s2s_use_starttls, s2s_timeout, s2s_queue_type].
+    fun (A) when is_atom(A) -> A end;
+opt_type(_) -> [route_subdomains, s2s_access].

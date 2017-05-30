@@ -5,7 +5,7 @@
 %%% Created : 11 Mar 2003 by Alexey Shchepin <alexey@sevcom.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2016   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -30,7 +30,7 @@
 -author('alexey@sevcom.net').
 
 -export([start/1, stop/0, mech_new/4, mech_step/2,
-	 parse/1, format_error/1, opt_type/1]).
+	 parse/1, opt_type/1]).
 
 -include("ejabberd.hrl").
 -include("logger.hrl").
@@ -39,23 +39,21 @@
 
 -type get_password_fun() :: fun((binary()) -> {false, any()} |
                                               {binary(), atom()}).
--type check_password_fun() :: fun((binary(), binary(), binary(), binary(),
+
+-type check_password_fun() :: fun((binary(), binary(), binary(),
                                    fun((binary()) -> binary())) ->
                                            {boolean(), any()} |
                                            false).
--type error_reason() :: parser_failed | invalid_digest_uri |
-			not_authorized | unexpected_response.
--export_type([error_reason/0]).
 
 -record(state, {step = 1 :: 1 | 3 | 5,
                 nonce = <<"">> :: binary(),
                 username = <<"">> :: binary(),
                 authzid = <<"">> :: binary(),
-                get_password :: get_password_fun(),
-                check_password :: check_password_fun(),
+                get_password = fun(_) -> {false, <<>>} end :: get_password_fun(),
+                check_password = fun(_, _, _, _, _) -> false end :: check_password_fun(),
                 auth_module :: atom(),
                 host = <<"">> :: binary(),
-                hostfqdn = [] :: [binary()]}).
+                hostfqdn = <<"">> :: binary()}).
 
 start(_Opts) ->
     Fqdn = get_local_fqdn(),
@@ -65,16 +63,6 @@ start(_Opts) ->
 			       digest).
 
 stop() -> ok.
-
--spec format_error(error_reason()) -> {atom(), binary()}.
-format_error(parser_failed) ->
-    {'bad-protocol', <<"Response decoding failed">>};
-format_error(invalid_digest_uri) ->
-    {'bad-protocol', <<"Invalid digest URI">>};
-format_error(not_authorized) ->
-    {'not-authorized', <<"Invalid username or password">>};
-format_error(unexpected_response) ->
-    {'bad-protocol', <<"Unexpected response">>}.
 
 mech_new(Host, GetPassword, _CheckPassword,
 	 CheckPasswordDigest) ->
@@ -92,8 +80,8 @@ mech_step(#state{step = 1, nonce = Nonce} = State, _) ->
 mech_step(#state{step = 3, nonce = Nonce} = State,
 	  ClientIn) ->
     case parse(ClientIn) of
-	bad -> {error, parser_failed};
-	KeyVals ->
+      bad -> {error, <<"bad-protocol">>};
+      KeyVals ->
 	  DigestURI = proplists:get_value(<<"digest-uri">>, KeyVals, <<>>),
 	  UserName = proplists:get_value(<<"username">>, KeyVals, <<>>),
 	  case is_digesturi_valid(DigestURI, State#state.host,
@@ -104,14 +92,14 @@ mech_step(#state{step = 3, nonce = Nonce} = State,
 		       "seems invalid: ~p (checking for Host "
 		       "~p, FQDN ~p)",
 		       [DigestURI, State#state.host, State#state.hostfqdn]),
-		{error, invalid_digest_uri, UserName};
+		{error, <<"not-authorized">>, UserName};
 	    true ->
 		AuthzId = proplists:get_value(<<"authzid">>, KeyVals, <<>>),
 		case (State#state.get_password)(UserName) of
-		  {false, _} -> {error, not_authorized, UserName};
+		  {false, _} -> {error, <<"not-authorized">>, UserName};
 		  {Passwd, AuthModule} ->
 		      case (State#state.check_password)(UserName, UserName, <<"">>,
-							proplists:get_value(<<"response">>, KeyVals, <<>>),
+		                    proplists:get_value(<<"response">>, KeyVals, <<>>),
 							fun (PW) ->
 								response(KeyVals,
 									 UserName,
@@ -128,8 +116,8 @@ mech_step(#state{step = 3, nonce = Nonce} = State,
 			     State#state{step = 5, auth_module = AuthModule,
 					 username = UserName,
 					 authzid = AuthzId}};
-			false -> {error, not_authorized, UserName};
-			{false, _} -> {error, not_authorized, UserName}
+			false -> {error, <<"not-authorized">>, UserName};
+			{false, _} -> {error, <<"not-authorized">>, UserName}
 		      end
 		end
 	  end
@@ -146,7 +134,7 @@ mech_step(#state{step = 5, auth_module = AuthModule,
       {auth_module, AuthModule}]};
 mech_step(A, B) ->
     ?DEBUG("SASL DIGEST: A ~p B ~p", [A, B]),
-    {error, unexpected_response}.
+    {error, <<"bad-protocol">>}.
 
 parse(S) -> parse1(binary_to_list(S), "", []).
 
@@ -195,15 +183,17 @@ is_digesturi_valid(DigestURICase, JabberDomain,
     DigestURI = stringprep:tolower(DigestURICase),
     case catch str:tokens(DigestURI, <<"/">>) of
 	[<<"xmpp">>, Host] ->
-	    IsHostFqdn = is_host_fqdn(Host, JabberFQDN),
+	    IsHostFqdn = is_host_fqdn(binary_to_list(Host), binary_to_list(JabberFQDN)),
 	    (Host == JabberDomain) or IsHostFqdn;
 	[<<"xmpp">>, Host, ServName] ->
-	    IsHostFqdn = is_host_fqdn(Host, JabberFQDN),
+	    IsHostFqdn = is_host_fqdn(binary_to_list(Host), binary_to_list(JabberFQDN)),
 	    (ServName == JabberDomain) and IsHostFqdn;
 	_ ->
 	    false
     end.
 
+is_host_fqdn(Host, [Letter | _Tail] = Fqdn) when not is_list(Letter) ->
+    Host == Fqdn;
 is_host_fqdn(_Host, []) ->
     false;
 is_host_fqdn(Host, [Fqdn | _FqdnTail]) when Host == Fqdn ->
@@ -212,17 +202,27 @@ is_host_fqdn(Host, [Fqdn | FqdnTail]) when Host /= Fqdn ->
     is_host_fqdn(Host, FqdnTail).
 
 get_local_fqdn() ->
-    case ejabberd_config:get_option(fqdn) of
-	undefined ->
-	    {ok, Hostname} = inet:gethostname(),
-	    {ok, {hostent, Fqdn, _, _, _, _}} = inet:gethostbyname(Hostname),
-	    [list_to_binary(Fqdn)];
-	Fqdn ->
-	    Fqdn
+    case catch get_local_fqdn2() of
+      Str when is_binary(Str) -> Str;
+      _ ->
+	  <<"unknown-fqdn, please configure fqdn "
+	    "option in ejabberd.yml!">>
+    end.
+
+get_local_fqdn2() ->
+    case ejabberd_config:get_option(
+           fqdn, fun iolist_to_binary/1) of
+        ConfiguredFqdn when is_binary(ConfiguredFqdn) ->
+            ConfiguredFqdn;
+        undefined ->
+            {ok, Hostname} = inet:gethostname(),
+            {ok, {hostent, Fqdn, _, _, _, _}} =
+            inet:gethostbyname(Hostname),
+            list_to_binary(Fqdn)
     end.
 
 hex(S) ->
-    str:to_hexlist(S).
+    p1_sha:to_hexlist(S).
 
 proplists_get_bin_value(Key, Pairs, Default) ->
     case proplists:get_value(Key, Pairs, Default) of
@@ -260,12 +260,5 @@ response(KeyVals, User, Passwd, Nonce, AuthzId,
 	  ":", (hex((erlang:md5(A2))))/binary>>,
     hex((erlang:md5(T))).
 
--spec opt_type(fqdn) -> fun((binary() | [binary()]) -> [binary()]);
-	      (atom()) -> [atom()].
-opt_type(fqdn) ->
-    fun(FQDN) when is_binary(FQDN) ->
-	    [FQDN];
-       (FQDNs) when is_list(FQDNs) ->
-	    [iolist_to_binary(FQDN) || FQDN <- FQDNs]
-    end;
+opt_type(fqdn) -> fun iolist_to_binary/1;
 opt_type(_) -> [fqdn].

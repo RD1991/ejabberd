@@ -1,0 +1,45 @@
+{
+	xmlel,
+	<<"message">>,
+	[{<<"type">>,<<"chat">>},{<<"id">>,<<"purplef3f42f24">>},{<<"to">>,<<"jose@localhost">>}],
+	[{xmlel,<<"paused">>,[{<<"xmlns">>,<<"http://jabber.org/protocol/chatstates">>}],[]}]
+}
+
+
+
+[
+	{
+		xmlel,
+		<<"active">>,
+    	[{<<"xmlns">>,<<"http://jabber.org/protocol/chatstates">>}],
+        []
+    },
+    {
+    	xmlel,
+    	<<"body">>,
+    	[],
+    	[{xmlcdata,<<"test">>}]
+    }
+]
+
+
+[{xmlel,<<"active">>,[{<<"xmlns">>,<<"http://jabber.org/protocol/chatstates">>}],[]},{xmlel,<<"body">>,[],[{xmlcdata,<<"test">>}]}]
+
+
+{xmlel,<<"message">>,[{<<"type">>,<<"chat">>},{<<"id">>,<<"purple4240e52d">>},{<<"to">>,<<"jose@localhost">>}],[{xmlel,<<"active">>,[{<<"xmlns">>,<<"http://jabber.org/protocol/chatstates">>}],[]},{xmlel,<<"body">>,[],[{xmlcdata,<<"h">>}]}]}
+
+
+{xmlel,
+<<"active">>,
+[{<<"xmlns">>,<<"http://jabber.org/protocol/chatstates">>}],[]},
+	{
+		xmlel,
+		<<"body">>,
+		[],
+		[{xmlcdata,<<"h">>}]
+	}
+
+
+{xmlel,<<"message">>,[{<<"type">>,<<"chat">>},{<<"id">>,<<"purple4240e52d">>},{<<"to">>,<<"jose@localhost">>}],[{xmlel,<<"active">>,[{<<"xmlns">>,<<"http://jabber.org/protocol/chatstates">>}],[]},{xmlel,<<"body">>,[],[{xmlcdata,<<"h">>}]}]}
+
+

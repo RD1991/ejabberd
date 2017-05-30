@@ -5,7 +5,7 @@
 %%% Created : 13 Dec 2002 by Alexey Shchepin <alexey@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2016   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -27,32 +27,14 @@
 
 -author('alexey@process-one.net').
 
--export([get_string/0, uniform/0, uniform/1, uniform/2, bytes/1,
-	 round_robin/1]).
+-export([get_string/0]).
 
--define(THRESHOLD, 16#10000000000000000).
+-export([start/0]).
+
+start() ->
+    ok.
 
 get_string() ->
-    R = crypto:rand_uniform(0, ?THRESHOLD),
-    integer_to_binary(R).
+    R = crypto:rand_uniform(0, 16#10000000000000000),
+    jlib:integer_to_binary(R).
 
-uniform() ->
-    crypto:rand_uniform(0, ?THRESHOLD)/?THRESHOLD.
-
-uniform(N) ->
-    crypto:rand_uniform(1, N+1).
-
-uniform(N, M) ->
-    crypto:rand_uniform(N, M+1).
-
--ifdef(STRONG_RAND_BYTES).
-bytes(N) ->
-    crypto:strong_rand_bytes(N).
--else.
-bytes(N) ->
-    crypto:rand_bytes(N).
--endif.
-
--spec round_robin(pos_integer()) -> non_neg_integer().
-round_robin(N) ->
-    p1_time_compat:unique_integer([monotonic, positive]) rem N.

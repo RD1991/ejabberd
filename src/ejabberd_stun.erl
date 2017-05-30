@@ -1,11 +1,12 @@
 %%%-------------------------------------------------------------------
-%%% File    : ejabberd_stun.erl
-%%% Author  : Evgeny Khramtsov <ekhramtsov@process-one.net>
-%%% Purpose : STUN RFC-5766
+%%% @author Evgeny Khramtsov <ekhramtsov@process-one.net>
+%%% @copyright (C) 2014, Evgeny Khramtsov
+%%% @doc
+%%%
+%%% @end
 %%% Created :  8 May 2014 by Evgeny Khramtsov <ekhramtsov@process-one.net>
 %%%
-%%%
-%%% ejabberd, Copyright (C) 2013-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2013-2016   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -27,23 +28,8 @@
 -protocol({rfc, 5766}).
 -protocol({xep, 176, '1.0'}).
 
--ifndef(STUN).
--include("logger.hrl").
--export([socket_type/0, start/2, listen_opt_type/1]).
-log_error() ->
-    ?CRITICAL_MSG("ejabberd is not compiled with STUN/TURN support", []).
-socket_type() ->
-    log_error(),
-    raw.
-listen_opt_type(_) ->
-    log_error(),
-    [].
-start(_, _) ->
-    log_error(),
-    {error, sip_not_compiled}.
--else.
 -export([tcp_init/2, udp_init/2, udp_recv/5, start/2,
-	 socket_type/0, listen_opt_type/1]).
+	 socket_type/0]).
 
 -include("ejabberd.hrl").
 -include("logger.hrl").
@@ -88,9 +74,14 @@ prepare_turn_opts(Opts, _UseTurn = true) ->
 	    ok
     end,
     AuthFun = fun ejabberd_auth:get_password_s/2,
-    Shaper = proplists:get_value(shaper, Opts, none),
-    AuthType = proplists:get_value(auth_type, Opts, user),
-    Realm = case proplists:get_value(auth_realm, Opts) of
+    Shaper = gen_mod:get_opt(shaper, Opts,
+			     fun(S) when is_atom(S) -> S end,
+			     none),
+    AuthType = gen_mod:get_opt(auth_type, Opts,
+			       fun(anonymous) -> anonymous;
+				  (user) -> user
+			       end, user),
+    Realm = case gen_mod:get_opt(auth_realm, Opts, fun iolist_to_binary/1) of
 		undefined when AuthType == user ->
 		    if NumberOfMyHosts > 1 ->
 			    ?WARNING_MSG("you have several virtual "
@@ -110,47 +101,3 @@ prepare_turn_opts(Opts, _UseTurn = true) ->
     MaxRate = shaper:get_max_rate(Shaper),
     Realm ++ [{auth_fun, AuthFun},{shaper, MaxRate} |
 	      lists:keydelete(shaper, 1, Opts)].
-
-listen_opt_type(use_turn) ->
-    fun(B) when is_boolean(B) -> B end;
-listen_opt_type(turn_ip) ->
-    fun(S) ->
-	    {ok, Addr} = inet_parse:ipv4_address(binary_to_list(S)),
-	    Addr
-    end;
-listen_opt_type(shaper) ->
-    fun acl:shaper_rules_validator/1;
-listen_opt_type(auth_type) ->
-    fun(anonymous) -> anonymous;
-       (user) -> user
-    end;
-listen_opt_type(auth_realm) ->
-    fun iolist_to_binary/1;
-listen_opt_type(tls) ->
-    fun(B) when is_boolean(B) -> B end;
-listen_opt_type(certfile) ->
-    fun(S) ->
-	    ejabberd_pkix:add_certfile(S),
-	    iolist_to_binary(S)
-    end;
-listen_opt_type(turn_min_port) ->
-    fun(P) when is_integer(P), P > 0, P =< 65535 -> P end;
-listen_opt_type(turn_max_port) ->
-    fun(P) when is_integer(P), P > 0, P =< 65535 -> P end;
-listen_opt_type(turn_max_allocations) ->
-    fun(I) when is_integer(I), I>0 -> I;
-       (unlimited) -> infinity;
-       (infinity) -> infinity
-    end;
-listen_opt_type(turn_max_permissions) ->
-    fun(I) when is_integer(I), I>0 -> I;
-       (unlimited) -> infinity;
-       (infinity) -> infinity
-    end;
-listen_opt_type(server_name) ->
-    fun iolist_to_binary/1;
-listen_opt_type(_) ->
-    [shaper, auth_type, auth_realm, tls, certfile, turn_min_port,
-     turn_max_port, turn_max_allocations, turn_max_permissions,
-     server_name].
--endif.

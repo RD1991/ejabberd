@@ -3,24 +3,7 @@
 %%% Author  : Badlop <badlop@ono.com>
 %%% Purpose : Tools for additional MUC administration
 %%% Created : 8 Sep 2007 by Badlop <badlop@ono.com>
-%%%
-%%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
-%%%
-%%% This program is free software; you can redistribute it and/or
-%%% modify it under the terms of the GNU General Public License as
-%%% published by the Free Software Foundation; either version 2 of the
-%%% License, or (at your option) any later version.
-%%%
-%%% This program is distributed in the hope that it will be useful,
-%%% but WITHOUT ANY WARRANTY; without even the implied warranty of
-%%% MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-%%% General Public License for more details.
-%%%
-%%% You should have received a copy of the GNU General Public License along
-%%% with this program; if not, write to the Free Software Foundation, Inc.,
-%%% 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
-%%%
+%%% Id      : $Id: mod_muc_admin.erl 1133 2012-10-17 22:13:06Z badlop $
 %%%----------------------------------------------------------------------
 
 -module(mod_muc_admin).
@@ -28,9 +11,8 @@
 
 -behaviour(gen_mod).
 
--export([start/2, stop/1, reload/3, depends/2, muc_online_rooms/1,
-	 muc_register_nick/3, muc_unregister_nick/1,
-	 create_room_with_opts/4, create_room/3, destroy_room/2,
+-export([start/2, stop/1, muc_online_rooms/1,
+	 muc_unregister_nick/1, create_room/3, destroy_room/2,
 	 create_rooms_file/1, destroy_rooms_file/1,
 	 rooms_unused_list/2, rooms_unused_destroy/2,
 	 get_user_rooms/2, get_room_occupants/2,
@@ -38,14 +20,13 @@
 	 change_room_option/4, get_room_options/2,
 	 set_room_affiliation/4, get_room_affiliations/2,
 	 web_menu_main/2, web_page_main/2, web_menu_host/3,
-	 subscribe_room/4, unsubscribe_room/2, get_subscribers/2,
 	 web_page_host/3, mod_opt_type/1, get_commands_spec/0]).
 
 -include("ejabberd.hrl").
 -include("logger.hrl").
--include("xmpp.hrl").
--include("mod_muc.hrl").
+-include("jlib.hrl").
 -include("mod_muc_room.hrl").
+-include("mod_muc.hrl").
 -include("ejabberd_http.hrl").
 -include("ejabberd_web_admin.hrl").
 -include("ejabberd_commands.hrl").
@@ -68,12 +49,6 @@ stop(Host) ->
     ejabberd_hooks:delete(webadmin_page_main, ?MODULE, web_page_main, 50),
     ejabberd_hooks:delete(webadmin_page_host, Host, ?MODULE, web_page_host, 50).
 
-reload(_Host, _NewOpts, _OldOpts) ->
-    ok.
-
-depends(_Host, _Opts) ->
-    [{mod_muc, hard}].
-
 %%%
 %%% Register commands
 %%%
@@ -84,19 +59,8 @@ get_commands_spec() ->
 		       desc = "List existing rooms ('global' to get all vhosts)",
                        policy = admin,
 		       module = ?MODULE, function = muc_online_rooms,
-		       args_desc = ["Server domain where the MUC service is, or 'global' for all"],
-		       args_example = ["example.com"],
-		       result_desc = "List of rooms",
-		       result_example = ["room1@muc.example.com", "room2@muc.example.com"],
 		       args = [{host, binary}],
 		       result = {rooms, {list, {room, string}}}},
-     #ejabberd_commands{name = muc_register_nick, tags = [muc],
-		       desc = "Register a nick in the MUC service",
-		       module = ?MODULE, function = muc_register_nick,
-		       args_desc = ["Nick", "User JID", "MUC service"],
-		       args_example = [<<"Tim">>, <<"tim@example.org">>, <<"muc.example.org">>],
-		       args = [{nick, binary}, {jid, binary}, {domain, binary}],
-		       result = {res, rescode}},
      #ejabberd_commands{name = muc_unregister_nick, tags = [muc],
 		       desc = "Unregister the nick in the MUC service",
 		       module = ?MODULE, function = muc_unregister_nick,
@@ -106,83 +70,46 @@ get_commands_spec() ->
      #ejabberd_commands{name = create_room, tags = [muc_room],
 		       desc = "Create a MUC room name@service in host",
 		       module = ?MODULE, function = create_room,
-		       args_desc = ["Room name", "MUC service", "Server host"],
-		       args_example = ["room1", "muc.example.com", "example.com"],
 		       args = [{name, binary}, {service, binary},
 			       {host, binary}],
 		       result = {res, rescode}},
      #ejabberd_commands{name = destroy_room, tags = [muc_room],
 		       desc = "Destroy a MUC room",
 		       module = ?MODULE, function = destroy_room,
-		       args_desc = ["Room name", "MUC service"],
-		       args_example = ["room1", "muc.example.com"],
 		       args = [{name, binary}, {service, binary}],
 		       result = {res, rescode}},
      #ejabberd_commands{name = create_rooms_file, tags = [muc],
 		       desc = "Create the rooms indicated in file",
 		       longdesc = "Provide one room JID per line. Rooms will be created after restart.",
 		       module = ?MODULE, function = create_rooms_file,
-		       args_desc = ["Path to the text file with one room JID per line"],
-		       args_example = ["/home/ejabberd/rooms.txt"],
 		       args = [{file, string}],
-		       result = {res, rescode}},
-     #ejabberd_commands{name = create_room_with_opts, tags = [muc_room],
-		       desc = "Create a MUC room name@service in host with given options",
-		       module = ?MODULE, function = create_room_with_opts,
-		       args_desc = ["Room name", "MUC service", "Server host", "List of options"],
-		       args_example = ["room1", "muc.example.com", "localhost", [{"members_only","true"}]],
-		       args = [{name, binary}, {service, binary},
-			       {host, binary},
-			       {options, {list,
-					  {option, {tuple,
-						    [{name, binary},
-						     {value, binary}
-						    ]}}
-					 }}],
 		       result = {res, rescode}},
      #ejabberd_commands{name = destroy_rooms_file, tags = [muc],
 		       desc = "Destroy the rooms indicated in file",
 		       longdesc = "Provide one room JID per line.",
 		       module = ?MODULE, function = destroy_rooms_file,
-		       args_desc = ["Path to the text file with one room JID per line"],
-		       args_example = ["/home/ejabberd/rooms.txt"],
 		       args = [{file, string}],
 		       result = {res, rescode}},
      #ejabberd_commands{name = rooms_unused_list, tags = [muc],
 		       desc = "List the rooms that are unused for many days in host",
 		       module = ?MODULE, function = rooms_unused_list,
-		       args_desc = ["Server host", "Number of days"],
-		       args_example = ["example.com", 31],
-		       result_desc = "List of unused rooms",
-		       result_example = ["room1@muc.example.com", "room2@muc.example.com"],
 		       args = [{host, binary}, {days, integer}],
 		       result = {rooms, {list, {room, string}}}},
      #ejabberd_commands{name = rooms_unused_destroy, tags = [muc],
 		       desc = "Destroy the rooms that are unused for many days in host",
 		       module = ?MODULE, function = rooms_unused_destroy,
-		       args_desc = ["Server host", "Number of days"],
-		       args_example = ["example.com", 31],
-		       result_desc = "List of unused rooms that has been destroyed",
-		       result_example = ["room1@muc.example.com", "room2@muc.example.com"],
 		       args = [{host, binary}, {days, integer}],
 		       result = {rooms, {list, {room, string}}}},
 
      #ejabberd_commands{name = get_user_rooms, tags = [muc],
 			desc = "Get the list of rooms where this user is occupant",
 			module = ?MODULE, function = get_user_rooms,
-		        args_desc = ["Username", "Server host"],
-		        args_example = ["tom", "example.com"],
-		        result_example = ["room1@muc.example.com", "room2@muc.example.com"],
 			args = [{user, binary}, {host, binary}],
 		        result = {rooms, {list, {room, string}}}},
 
      #ejabberd_commands{name = get_room_occupants, tags = [muc_room],
 			desc = "Get the list of occupants of a MUC room",
 			module = ?MODULE, function = get_room_occupants,
-		        args_desc = ["Room name", "MUC service"],
-		        args_example = ["room1", "muc.example.com"],
-		        result_desc = "The list of occupants with JID, nick and affiliation",
-		        result_example = [{"user1@example.com/psi", "User 1", "owner"}],
 			args = [{name, binary}, {service, binary}],
 			result = {occupants, {list,
 					      {occupant, {tuple,
@@ -195,10 +122,6 @@ get_commands_spec() ->
      #ejabberd_commands{name = get_room_occupants_number, tags = [muc_room],
 			desc = "Get the number of occupants of a MUC room",
 			module = ?MODULE, function = get_room_occupants_number,
-		        args_desc = ["Room name", "MUC service"],
-		        args_example = ["room1", "muc.example.com"],
-		        result_desc = "Number of room occupants",
-		        result_example = 7,
 			args = [{name, binary}, {service, binary}],
 			result = {occupants, integer}},
 
@@ -206,27 +129,18 @@ get_commands_spec() ->
 			desc = "Send a direct invitation to several destinations",
 			longdesc = "Password and Message can also be: none. Users JIDs are separated with : ",
 			module = ?MODULE, function = send_direct_invitation,
-		        args_desc = ["Room name", "MUC service", "Password, or none",
-			 "Reason text, or none", "Users JIDs separated with : characters"],
-		        args_example = ["room1", "muc.example.com", none, none, "user2@localhost:user3@example.com"],
 		        args = [{name, binary}, {service, binary}, {password, binary}, {reason, binary}, {users, binary}],
 		        result = {res, rescode}},
 
      #ejabberd_commands{name = change_room_option, tags = [muc_room],
 		       desc = "Change an option in a MUC room",
 		       module = ?MODULE, function = change_room_option,
-		       args_desc = ["Room name", "MUC service", "Option name", "Value to assign"],
-		       args_example = ["room1", "muc.example.com", "members_only", "true"],
 		       args = [{name, binary}, {service, binary},
 			       {option, binary}, {value, binary}],
 		       result = {res, rescode}},
      #ejabberd_commands{name = get_room_options, tags = [muc_room],
 		        desc = "Get options from a MUC room",
 		        module = ?MODULE, function = get_room_options,
-		        args_desc = ["Room name", "MUC service"],
-		        args_example = ["room1", "muc.example.com"],
-		        result_desc = "List of room options tuples with name and value",
-		        result_example = [{"members_only", "true"}],
 		        args = [{name, binary}, {service, binary}],
 			result = {options, {list,
 						 {option, {tuple,
@@ -234,50 +148,16 @@ get_commands_spec() ->
 								 {value, string}
 								]}}
 						}}},
-     #ejabberd_commands{name = subscribe_room, tags = [muc_room],
-			desc = "Subscribe to a MUC conference",
-			module = ?MODULE, function = subscribe_room,
-			args_desc = ["Full JID, including some resource", "a user's nick",
-			    "the room to subscribe", "nodes separated by commas: ,"],
-			args_example = ["tom@localhost/dummy", "Tom", "room1@conference.localhost",
-			    "urn:xmpp:mucsub:nodes:messages,urn:xmpp:mucsub:nodes:affiliations"],
-			result_desc = "The list of nodes that has subscribed",
-			result_example = ["urn:xmpp:mucsub:nodes:messages",
-			    "urn:xmpp:mucsub:nodes:affiliations"],
-			args = [{user, binary}, {nick, binary}, {room, binary},
-				{nodes, binary}],
-			result = {nodes, {list, {node, string}}}},
-     #ejabberd_commands{name = unsubscribe_room, tags = [muc_room],
-			desc = "Unsubscribe from a MUC conference",
-			module = ?MODULE, function = unsubscribe_room,
-			args_desc = ["User JID", "the room to subscribe"],
-			args_example = ["tom@localhost", "room1@conference.localhost"],
-			args = [{user, binary}, {room, binary}],
-			result = {res, rescode}},
-     #ejabberd_commands{name = get_subscribers, tags = [muc_room],
-			desc = "List subscribers of a MUC conference",
-			module = ?MODULE, function = get_subscribers,
-		        args_desc = ["Room name", "MUC service"],
-		        args_example = ["room1", "muc.example.com"],
-		        result_desc = "The list of users that are subscribed to that room",
-		        result_example = ["user2@example.com", "user3@example.com"],
-			args = [{name, binary}, {service, binary}],
-			result = {subscribers, {list, {jid, string}}}},
+
      #ejabberd_commands{name = set_room_affiliation, tags = [muc_room],
 		       desc = "Change an affiliation in a MUC room",
 		       module = ?MODULE, function = set_room_affiliation,
-		       args_desc = ["Room name", "MUC service", "User JID", "Affiliation to set"],
-		       args_example = ["room1", "muc.example.com", "user2@example.com", "member"],
 		       args = [{name, binary}, {service, binary},
 			       {jid, binary}, {affiliation, binary}],
 		       result = {res, rescode}},
      #ejabberd_commands{name = get_room_affiliations, tags = [muc_room],
 			desc = "Get the list of affiliations of a MUC room",
 			module = ?MODULE, function = get_room_affiliations,
-		        args_desc = ["Room name", "MUC service"],
-		        args_example = ["room1", "muc.example.com"],
-		        result_desc = "The list of affiliations with username, domain, affiliation and reason",
-		        result_example = [{"user1", "example.com", "member"}],
 			args = [{name, binary}, {service, binary}],
 			result = {affiliations, {list,
 						 {affiliation, {tuple,
@@ -295,30 +175,26 @@ get_commands_spec() ->
 %%%
 
 muc_online_rooms(ServerHost) ->
-    Hosts = find_hosts(ServerHost),
-    lists:flatmap(
-      fun(Host) ->
-	      [<<Name/binary, "@", Host/binary>>
-	       || {Name, _, _} <- mod_muc:get_online_rooms(Host)]
-      end, Hosts).
-
-muc_register_nick(Nick, JIDBinary, Domain) ->
-    try jid:decode(JIDBinary) of
-	JID ->
-	    F = fun (MHost, MNick) ->
-		    mnesia:write(#muc_registered{us_host=MHost, nick=MNick})
-		end,
-	    case mnesia:transaction(F, [{{JID#jid.luser, JID#jid.lserver},
-					 Domain}, Nick]) of
-		{atomic, ok} -> ok;
-		{aborted, _Error} -> error
-	    end
-    catch _:{bad_jid, _} -> throw({error, "Malformed JID"})
-    end.
+    MUCHost = find_host(ServerHost),
+    Rooms = ets:tab2list(muc_online_room),
+    lists:foldl(
+      fun(Room, Results) ->
+	      {Roomname, Host} = Room#muc_online_room.name_host,
+	      case MUCHost of
+		  global ->
+		      [<<Roomname/binary, "@", Host/binary>> | Results];
+		  Host ->
+		      [<<Roomname/binary, "@", Host/binary>> | Results];
+		  _ ->
+		      Results
+	      end
+      end,
+      [],
+      Rooms).
 
 muc_unregister_nick(Nick) ->
     F2 = fun(N) ->
-		 [{_,Key,_}|_] = mnesia:index_read(muc_registered, N, 3),
+		 [{_,Key,_}] = mnesia:index_read(muc_registered, N, 3),
 		 mnesia:delete({muc_registered, Key})
 	 end,
     case mnesia:transaction(F2, [Nick], 1) of
@@ -329,18 +205,14 @@ muc_unregister_nick(Nick) ->
     end.
 
 get_user_rooms(LUser, LServer) ->
-    lists:flatmap(
-      fun(ServerHost) ->
-	      case gen_mod:is_loaded(ServerHost, mod_muc) of
-		  true ->
-		      Rooms = mod_muc:get_online_rooms_by_user(
-				ServerHost, LUser, LServer),
-		      [<<Name/binary, "@", Host/binary>>
-			   || {Name, Host} <- Rooms];
-		  false ->
-		      []
-	      end
-      end, ?MYHOSTS).
+    US = {LUser, LServer},
+    case catch ets:select(muc_online_users,
+                          [{#muc_online_users{us = US, room='$1', host='$2', _ = '_'}, [], [{{'$1', '$2'}}]}])
+        of
+      Res when is_list(Res) ->
+	[<<R/binary, "@", H/binary>> || {R, H} <- Res];
+      _ -> []
+    end.
 
 %%----------------------------
 %% Ad-hoc commands
@@ -366,18 +238,14 @@ web_menu_host(Acc, _Host, Lang) ->
 
 -define(TDTD(L, N),
 	?XE(<<"tr">>, [?XCT(<<"td">>, L),
-		       ?XC(<<"td">>, integer_to_binary(N))
+		       ?XC(<<"td">>, jlib:integer_to_binary(N))
 		      ])).
 
 web_page_main(_, #request{path=[<<"muc">>], lang = Lang} = _Request) ->
-    OnlineRoomsNumber = lists:foldl(
-			  fun(Host, Acc) ->
-				  Acc + mod_muc:count_online_rooms(Host)
-			  end, 0, find_hosts(global)),
     Res = [?XCT(<<"h1">>, <<"Multi-User Chat">>),
 	   ?XCT(<<"h3">>, <<"Statistics">>),
 	   ?XAE(<<"table">>, [],
-		[?XE(<<"tbody">>, [?TDTD(<<"Total rooms">>, OnlineRoomsNumber),
+		[?XE(<<"tbody">>, [?TDTD(<<"Total rooms">>, ets:info(muc_online_room, size)),
 				   ?TDTD(<<"Permanent rooms">>, mnesia:table_info(muc_room, size)),
 				   ?TDTD(<<"Registered nicknames">>, mnesia:table_info(muc_registered, size))
 				  ])
@@ -412,7 +280,7 @@ get_sort_query(Q) ->
 
 get_sort_query2(Q) ->
     {value, {_, String}} = lists:keysearch(<<"sort">>, 1, Q),
-    Integer = binary_to_integer(String),
+    Integer = jlib:binary_to_integer(String),
     case Integer >= 0 of
 	true -> {ok, {normal, Integer}};
 	false -> {ok, {reverse, abs(Integer)}}
@@ -438,7 +306,7 @@ make_rooms_page(Host, Lang, {Sort_direction, Sort_column}) ->
     {Titles_TR, _} =
 	lists:mapfoldl(
 	  fun(Title, Num_column) ->
-		  NCS = integer_to_binary(Num_column),
+		  NCS = jlib:integer_to_binary(Num_column),
 		  TD = ?XE(<<"td">>, [?CT(Title),
 				      ?C(<<" ">>),
 				      ?AC(<<"?sort=", NCS/binary>>, <<"<">>),
@@ -488,7 +356,7 @@ build_info_room({Name, Host, Pid}) ->
 	    false ->
 		Last_message1 = queue:last(History),
 		{_, _, _, Ts_last, _} = Last_message1,
-		xmpp_util:encode_timestamp(Ts_last)
+		jlib:timestamp_to_legacy(Ts_last)
 	end,
 
     {<<Name/binary, "@", Host/binary>>,
@@ -512,12 +380,12 @@ prepare_room_info(Room_info) ->
      Just_created,
      Title} = Room_info,
     [NameHost,
-     integer_to_binary(Num_participants),
+     jlib:integer_to_binary(Num_participants),
      Ts_last_message,
-     misc:atom_to_binary(Public),
-     misc:atom_to_binary(Persistent),
-     misc:atom_to_binary(Logging),
-     misc:atom_to_binary(Just_created),
+     jlib:atom_to_binary(Public),
+     jlib:atom_to_binary(Persistent),
+     jlib:atom_to_binary(Logging),
+     jlib:atom_to_binary(Just_created),
      Title].
 
 
@@ -529,37 +397,27 @@ prepare_room_info(Room_info) ->
 %%       ok | error
 %% @doc Create a room immediately with the default options.
 create_room(Name1, Host1, ServerHost) ->
-    create_room_with_opts(Name1, Host1, ServerHost, []).
-
-create_room_with_opts(Name1, Host1, ServerHost, CustomRoomOpts) ->
-    true = (error /= (Name = jid:nodeprep(Name1))),
-    true = (error /= (Host = jid:nodeprep(Host1))),
+    Name = jid:nodeprep(Name1),
+    Host = jid:nodeprep(Host1),
 
     %% Get the default room options from the muc configuration
     DefRoomOpts = gen_mod:get_module_opt(ServerHost, mod_muc,
-					 default_room_options, []),
-    %% Change default room options as required
-    FormattedRoomOpts = [format_room_option(Opt, Val) || {Opt, Val}<-CustomRoomOpts],
-    RoomOpts = lists:ukeymerge(1,
-                               lists:keysort(1, FormattedRoomOpts),
-                               lists:keysort(1, DefRoomOpts)),
+					 default_room_options, fun(X) -> X end, []),
 
     %% Store the room on the server, it is not started yet though at this point
-    mod_muc:store_room(ServerHost, Host, Name, RoomOpts),
+    mod_muc:store_room(ServerHost, Host, Name, DefRoomOpts),
 
     %% Get all remaining mod_muc parameters that might be utilized
-    Access = gen_mod:get_module_opt(ServerHost, mod_muc, access, all),
-    AcCreate = gen_mod:get_module_opt(ServerHost, mod_muc, access_create, all),
-    AcAdmin = gen_mod:get_module_opt(ServerHost, mod_muc, access_admin, none),
-    AcPer = gen_mod:get_module_opt(ServerHost, mod_muc, access_persistent, all),
-    HistorySize = gen_mod:get_module_opt(ServerHost, mod_muc, history_size, 20),
-    RoomShaper = gen_mod:get_module_opt(ServerHost, mod_muc, room_shaper, none),
-    QueueType = gen_mod:get_module_opt(ServerHost, mod_muc, queue_type,
-				       ejabberd_config:default_queue_type(ServerHost)),
+    Access = gen_mod:get_module_opt(ServerHost, mod_muc, access, fun(X) -> X end, all),
+    AcCreate = gen_mod:get_module_opt(ServerHost, mod_muc, access_create, fun(X) -> X end, all),
+    AcAdmin = gen_mod:get_module_opt(ServerHost, mod_muc, access_admin, fun(X) -> X end, none),
+    AcPer = gen_mod:get_module_opt(ServerHost, mod_muc, access_persistent, fun(X) -> X end, all),
+    HistorySize = gen_mod:get_module_opt(ServerHost, mod_muc, history_size, fun(X) -> X end, 20),
+    RoomShaper = gen_mod:get_module_opt(ServerHost, mod_muc, room_shaper, fun(X) -> X end, none),
 
     %% If the room does not exist yet in the muc_online_room
-    case mod_muc:find_online_room(Name, Host) of
-	error ->
+    case mnesia:dirty_read(muc_online_room, {Name, Host}) of
+        [] ->
 	    %% Start the room
 	    {ok, Pid} = mod_muc_room:start(
 			  Host,
@@ -568,13 +426,19 @@ create_room_with_opts(Name1, Host1, ServerHost, CustomRoomOpts) ->
 			  Name,
 			  HistorySize,
 			  RoomShaper,
-			  RoomOpts,
-			  QueueType),
-	    mod_muc:register_online_room(Name, Host, Pid),
+			  DefRoomOpts),
+	    {atomic, ok} = register_room(Host, Name, Pid),
 	    ok;
-	{ok, _} ->
+	_ ->
 	    error
     end.
+
+register_room(Host, Name, Pid) ->
+    F = fun() ->
+		mnesia:write(#muc_online_room{name_host = {Name, Host},
+					      pid = Pid})
+	end,
+    mnesia:transaction(F).
 
 %% Create the room only in the database.
 %% It is required to restart the MUC service for the room to appear.
@@ -588,11 +452,12 @@ muc_create_room(ServerHost, {Name, Host, _}, DefRoomOpts) ->
 %% If the room has participants, they are not notified that the room was destroyed;
 %% they will notice when they try to chat and receive an error that the room doesn't exist.
 destroy_room(Name, Service) ->
-    case mod_muc:find_online_room(Name, Service) of
-	{ok, Pid} ->
+    case mnesia:dirty_read(muc_online_room, {Name, Service}) of
+	[R] ->
+	    Pid = R#muc_online_room.pid,
 	    gen_fsm:send_all_state_event(Pid, destroy),
 	    ok;
-	error ->
+	[] ->
 	    error
     end.
 
@@ -609,7 +474,7 @@ destroy_room({N, H, SH}) ->
 %% The file encoding must be UTF-8
 
 destroy_rooms_file(Filename) ->
-    {ok, F} = file:open(Filename, [read]),
+    {ok, F} = file:open(Filename, [read, binary]),
     RJID = read_room(F),
     Rooms = read_rooms(F, RJID, []),
     file:close(F),
@@ -618,9 +483,7 @@ destroy_rooms_file(Filename) ->
 
 read_rooms(_F, eof, L) ->
     L;
-read_rooms(F, no_room, L) ->
-    RJID2 = read_room(F),
-    read_rooms(F, RJID2, L);
+
 read_rooms(F, RJID, L) ->
     RJID2 = read_room(F),
     read_rooms(F, RJID2, [RJID | L]).
@@ -630,7 +493,7 @@ read_room(F) ->
 	eof -> eof;
 	String ->
 	    case io_lib:fread("~s", String) of
-		{ok, [RoomJID], _} -> split_roomjid(list_to_binary(RoomJID));
+		{ok, [RoomJID], _} -> split_roomjid(RoomJID);
 		{error, What} ->
 		    io:format("Parse error: what: ~p~non the line: ~p~n~n", [What, String])
 	    end
@@ -639,25 +502,23 @@ read_room(F) ->
 %% This function is quite rudimentary
 %% and may not be accurate
 split_roomjid(RoomJID) ->
-    split_roomjid2(binary:split(RoomJID, <<"@">>)).
-split_roomjid2([Name, Host]) ->
+    [Name, Host] = binary:split(RoomJID, <<"@">>),
     [_MUC_service_name, ServerHost] = binary:split(Host, <<".">>),
-    {Name, Host, ServerHost};
-split_roomjid2(_) ->
-    no_room.
+    {Name, Host, ServerHost}.
 
 %%----------------------------
 %% Create Rooms in File
 %%----------------------------
 
 create_rooms_file(Filename) ->
-    {ok, F} = file:open(Filename, [read]),
+    {ok, F} = file:open(Filename, [read, binary]),
     RJID = read_room(F),
     Rooms = read_rooms(F, RJID, []),
     file:close(F),
     %% Read the default room options defined for the first virtual host
     DefRoomOpts = gen_mod:get_module_opt(?MYNAME, mod_muc,
-					 default_room_options, []),
+					 default_room_options,
+					 fun(L) when is_list(L) -> L end, []),
     [muc_create_room(?MYNAME, A, DefRoomOpts) || A <- Rooms],
 	ok.
 
@@ -701,12 +562,19 @@ muc_unused2(Action, ServerHost, Host, Last_allowed) ->
 %%---------------
 %% Get info
 
-get_rooms(ServerHost) ->
-    Hosts = find_hosts(ServerHost),
-    lists:flatmap(
-      fun(Host) ->
-	      mod_muc:get_online_rooms(Host)
-      end, Hosts).
+get_rooms(Host) ->
+    Get_room_names = fun(Room_reg, Names) ->
+			     Pid = Room_reg#muc_online_room.pid,
+			     case {Host, Room_reg#muc_online_room.name_host} of
+				 {Host, {Name1, Host}} ->
+				     [{Name1, Host, Pid} | Names];
+				 {global, {Name1, Host1}} ->
+				     [{Name1, Host1, Pid} | Names];
+				 _ ->
+				     Names
+			     end
+		     end,
+    ets:foldr(Get_room_names, [], muc_online_room).
 
 get_room_config(Room_pid) ->
     {ok, R} = gen_fsm:sync_send_all_state_event(Room_pid, get_config),
@@ -802,7 +670,7 @@ get_room_occupants(Pid) ->
     S = get_room_state(Pid),
     lists:map(
       fun({_LJID, Info}) ->
-	      {jid:encode(Info#user.jid),
+	      {jid:to_string(Info#user.jid),
 	       Info#user.nick,
 	       atom_to_list(Info#user.role)}
       end,
@@ -817,8 +685,9 @@ get_room_occupants_number(Room, Host) ->
 %% http://xmpp.org/extensions/xep-0249.html
 
 send_direct_invitation(RoomName, RoomService, Password, Reason, UsersString) ->
-    RoomJid = jid:make(RoomName, RoomService),
-    XmlEl = build_invitation(Password, Reason, RoomJid),
+    RoomJid = jid:make(RoomName, RoomService, <<"">>),
+    RoomString = jid:to_string(RoomJid),
+    XmlEl = build_invitation(Password, Reason, RoomString),
     UsersStrings = get_users_to_invite(RoomJid, UsersString),
     [send_direct_invitation(RoomJid, UserStrings, XmlEl)
      || UserStrings <- UsersStrings],
@@ -829,11 +698,11 @@ get_users_to_invite(RoomJid, UsersString) ->
     UsersStrings = binary:split(UsersString, <<":">>, [global]),
     OccupantsTuples = get_room_occupants(RoomJid#jid.luser,
 					 RoomJid#jid.lserver),
-    OccupantsJids = [jid:decode(JidString)
+    OccupantsJids = [jid:from_string(JidString)
 		     || {JidString, _Nick, _} <- OccupantsTuples],
     lists:filtermap(
       fun(UserString) ->
-	      UserJid = jid:decode(UserString),
+	      UserJid = jid:from_string(UserString),
 	      Val = lists:all(fun(OccupantJid) ->
 				      UserJid#jid.luser /= OccupantJid#jid.luser
 					  orelse UserJid#jid.lserver /= OccupantJid#jid.lserver
@@ -846,20 +715,24 @@ get_users_to_invite(RoomJid, UsersString) ->
       end,
       UsersStrings).
 
-build_invitation(Password, Reason, RoomJid) ->
-    Invite = #x_conference{jid = RoomJid,
-			   password = case Password of
-					  <<"none">> -> <<>>;
-					  _ -> Password
-				      end,
-			   reason = case Reason of
-					<<"none">> -> <<>>;
-					_ -> Reason
-				    end},
-    #message{sub_els = [Invite]}.
+build_invitation(Password, Reason, RoomString) ->
+    PasswordAttrList = case Password of
+	<<"none">> -> [];
+	_ -> [{<<"password">>, Password}]
+    end,
+    ReasonAttrList = case Reason of
+	<<"none">> -> [];
+	_ -> [{<<"reason">>, Reason}]
+    end,
+    XAttrs = [{<<"xmlns">>, ?NS_XCONFERENCE},
+	      {<<"jid">>, RoomString}]
+	++ PasswordAttrList
+	++ ReasonAttrList,
+    XEl = {xmlel, <<"x">>, XAttrs, []},
+    {xmlel, <<"message">>, [], [XEl]}.
 
-send_direct_invitation(FromJid, UserJid, Msg) ->
-    ejabberd_router:route(xmpp:set_from_to(Msg, FromJid, UserJid)).
+send_direct_invitation(FromJid, UserJid, XmlEl) ->
+    ejabberd_router:route(FromJid, UserJid, XmlEl).
 
 %%----------------------------
 %% Change Room Option
@@ -872,40 +745,36 @@ send_direct_invitation(FromJid, UserJid, Msg) ->
 %% the option to change (for example title or max_users),
 %% and the value to assign to the new option.
 %% For example:
-%%   change_room_option(<<"testroom">>, <<"conference.localhost">>, <<"title">>, <<"Test Room">>)
+%%   change_room_option("testroom", "conference.localhost", "title", "Test Room")
+change_room_option(Name, Service, Option, Value) when is_atom(Option) ->
+    Pid = get_room_pid(Name, Service),
+    {ok, _} = change_room_option(Pid, Option, Value),
+    ok;
 change_room_option(Name, Service, OptionString, ValueString) ->
-    case get_room_pid(Name, Service) of
-	room_not_found ->
-	    room_not_found;
-	Pid ->
-	    {Option, Value} = format_room_option(OptionString, ValueString),
-	    Config = get_room_config(Pid),
-	    Config2 = change_option(Option, Value, Config),
-	    {ok, _} = gen_fsm:sync_send_all_state_event(Pid, {change_config, Config2}),
-	    ok
-    end.
-
-format_room_option(OptionString, ValueString) ->
-    Option = misc:binary_to_atom(OptionString),
+    Option = jlib:binary_to_atom(OptionString),
     Value = case Option of
 		title -> ValueString;
 		description -> ValueString;
 		password -> ValueString;
 		subject ->ValueString;
 		subject_author ->ValueString;
-		presence_broadcast ->misc:expr_to_term(ValueString);
-		max_users -> binary_to_integer(ValueString);
-		_ -> misc:binary_to_atom(ValueString)
+		max_users -> jlib:binary_to_integer(ValueString);
+		_ -> jlib:binary_to_atom(ValueString)
 	    end,
-    {Option, Value}.
+    change_room_option(Name, Service, Option, Value).
+
+change_room_option(Pid, Option, Value) ->
+    Config = get_room_config(Pid),
+    Config2 = change_option(Option, Value, Config),
+    gen_fsm:sync_send_all_state_event(Pid, {change_config, Config2}).
 
 %% @doc Get the Pid of an existing MUC room, or 'room_not_found'.
 get_room_pid(Name, Service) ->
-    case mod_muc:find_online_room(Name, Service) of
-	error ->
+    case mnesia:dirty_read(muc_online_room, {Name, Service}) of
+	[] ->
 	    room_not_found;
-	{ok, Pid} ->
-	    Pid
+	[Room] ->
+	    Room#muc_online_room.pid
     end.
 
 %% It is required to put explicitely all the options because
@@ -917,7 +786,6 @@ change_option(Option, Value, Config) ->
 	allow_private_messages -> Config#config{allow_private_messages = Value};
 	allow_private_messages_from_visitors -> Config#config{allow_private_messages_from_visitors = Value};
 	allow_query_users -> Config#config{allow_query_users = Value};
-	allow_subscription -> Config#config{allow_subscription = Value};
 	allow_user_invites -> Config#config{allow_user_invites = Value};
 	allow_visitor_nickchange -> Config#config{allow_visitor_nickchange = Value};
 	allow_visitor_status -> Config#config{allow_visitor_status = Value};
@@ -934,7 +802,6 @@ change_option(Option, Value, Config) ->
 	password -> Config#config{password = Value};
 	password_protected -> Config#config{password_protected = Value};
 	persistent -> Config#config{persistent = Value};
-	presence_broadcast -> Config#config{presence_broadcast = Value};
 	public -> Config#config{public = Value};
 	public_list -> Config#config{public_list = Value};
 	title -> Config#config{title = Value};
@@ -957,12 +824,8 @@ get_room_options(Pid) ->
     get_options(Config).
 
 get_options(Config) ->
-    Fields = [misc:atom_to_binary(Field) || Field <- record_info(fields, config)],
-    [config | ValuesRaw] = tuple_to_list(Config),
-    Values = lists:map(fun(V) when is_atom(V) -> misc:atom_to_binary(V);
-                          (V) when is_integer(V) -> integer_to_binary(V);
-                          (V) when is_tuple(V); is_list(V) -> list_to_binary(hd(io_lib:format("~w", [V])));
-                          (V) -> V end, ValuesRaw),
+    Fields = record_info(fields, config),
+    [config | Values] = tuple_to_list(Config),
     lists:zip(Fields, Values).
 
 %%----------------------------
@@ -973,9 +836,10 @@ get_options(Config) ->
 %%    [{JID::string(), Domain::string(), Role::string(), Reason::string()}]
 %% @doc Get the affiliations of  the room Name@Service.
 get_room_affiliations(Name, Service) ->
-    case mod_muc:find_online_room(Name, Service) of
-	{ok, Pid} ->
+    case mnesia:dirty_read(muc_online_room, {Name, Service}) of
+	[R] ->
 	    %% Get the PID of the online room, then request its state
+	    Pid = R#muc_online_room.pid,
 	    {ok, StateData} = gen_fsm:sync_send_all_state_event(Pid, get_state),
 	    Affiliations = ?DICT:to_list(StateData#state.affiliations),
 	    lists:map(
@@ -984,7 +848,7 @@ get_room_affiliations(Name, Service) ->
 		 ({{Uname, Domain, _Res}, Aff}) when is_atom(Aff)->
 		      {Uname, Domain, Aff, <<>>}
 	      end, Affiliations);
-	error ->
+	[] ->
 	    throw({error, "The room does not exist."})
     end.
 
@@ -1001,133 +865,41 @@ get_room_affiliations(Name, Service) ->
 %% If the affiliation is 'none', the action is to remove,
 %% In any other case the action will be to create the affiliation.
 set_room_affiliation(Name, Service, JID, AffiliationString) ->
-    Affiliation = misc:binary_to_atom(AffiliationString),
-    case mod_muc:find_online_room(Name, Service) of
-	{ok, Pid} ->
+    Affiliation = jlib:binary_to_atom(AffiliationString),
+    case mnesia:dirty_read(muc_online_room, {Name, Service}) of
+	[R] ->
 	    %% Get the PID for the online room so we can get the state of the room
-	    {ok, StateData} = gen_fsm:sync_send_all_state_event(Pid, {process_item_change, {jid:decode(JID), affiliation, Affiliation, <<"">>}, <<"">>}),
+	    Pid = R#muc_online_room.pid,
+	    {ok, StateData} = gen_fsm:sync_send_all_state_event(Pid, {process_item_change, {jid:from_string(JID), affiliation, Affiliation, <<"">>}, <<"">>}),
 	    mod_muc:store_room(StateData#state.server_host, StateData#state.host, StateData#state.room, make_opts(StateData)),
 	    ok;
-	error ->
+	[] ->
 	    error
     end.
 
-%%%
-%%% MUC Subscription
-%%%
-
-subscribe_room(_User, Nick, _Room, _Nodes) when Nick == <<"">> ->
-    throw({error, "Nickname must be set"});
-subscribe_room(User, Nick, Room, Nodes) ->
-    NodeList = re:split(Nodes, "\\h*,\\h*"),
-    try jid:decode(Room) of
-	#jid{luser = Name, lserver = Host} when Name /= <<"">> ->
-	    try jid:decode(User) of
-		#jid{lresource = <<"">>} ->
-		    throw({error, "User's JID should have a resource"});
-		UserJID ->
-		    case get_room_pid(Name, Host) of
-			Pid when is_pid(Pid) ->
-			    case gen_fsm:sync_send_all_state_event(
-				   Pid,
-				   {muc_subscribe, UserJID, Nick, NodeList}) of
-				{ok, SubscribedNodes} ->
-				    SubscribedNodes;
-				{error, Reason} ->
-				    throw({error, binary_to_list(Reason)})
-			    end;
-			_ ->
-			    throw({error, "The room does not exist"})
-		    end
-	    catch _:{bad_jid, _} ->
-		    throw({error, "Malformed user JID"})
-	    end;
-	_ ->
-	    throw({error, "Malformed room JID"})
-    catch _:{bad_jid, _} ->
-	    throw({error, "Malformed room JID"})
-    end.
-
-unsubscribe_room(User, Room) ->
-    try jid:decode(Room) of
-	#jid{luser = Name, lserver = Host} when Name /= <<"">> ->
-	    try jid:decode(User) of
-		UserJID ->
-		    case get_room_pid(Name, Host) of
-			Pid when is_pid(Pid) ->
-			    case gen_fsm:sync_send_all_state_event(
-				   Pid,
-				   {muc_unsubscribe, UserJID}) of
-				ok ->
-				    ok;
-				{error, Reason} ->
-				    throw({error, binary_to_list(Reason)})
-			    end;
-			_ ->
-			    throw({error, "The room does not exist"})
-		    end
-	    catch _:{bad_jid, _} ->
-		    throw({error, "Malformed user JID"})
-	    end;
-	_ ->
-	    throw({error, "Malformed room JID"})
-    catch _:{bad_jid, _} ->
-	    throw({error, "Malformed room JID"})
-    end.
-
-get_subscribers(Name, Host) ->
-    case get_room_pid(Name, Host) of
-	Pid when is_pid(Pid) ->
-	    {ok, JIDList} = gen_fsm:sync_send_all_state_event(Pid, get_subscribers),
-	    [jid:encode(jid:remove_resource(J)) || J <- JIDList];
-	_ ->
-	    throw({error, "The room does not exist"})
-    end.
-
-%% Copied from mod_muc_room.erl
-get_config_opt_name(Pos) ->
-    Fs = [config|record_info(fields, config)],
-    lists:nth(Pos, Fs).
--define(MAKE_CONFIG_OPT(Opt),
-        {get_config_opt_name(Opt), element(Opt, Config)}).
 make_opts(StateData) ->
     Config = StateData#state.config,
-    Subscribers = (?DICT):fold(
-                    fun(_LJID, Sub, Acc) ->
-                            [{Sub#subscriber.jid,
-                              Sub#subscriber.nick,
-                              Sub#subscriber.nodes}|Acc]
-                    end, [], StateData#state.subscribers),
-    [?MAKE_CONFIG_OPT(#config.title), ?MAKE_CONFIG_OPT(#config.description),
-     ?MAKE_CONFIG_OPT(#config.allow_change_subj),
-     ?MAKE_CONFIG_OPT(#config.allow_query_users),
-     ?MAKE_CONFIG_OPT(#config.allow_private_messages),
-     ?MAKE_CONFIG_OPT(#config.allow_private_messages_from_visitors),
-     ?MAKE_CONFIG_OPT(#config.allow_visitor_status),
-     ?MAKE_CONFIG_OPT(#config.allow_visitor_nickchange),
-     ?MAKE_CONFIG_OPT(#config.public), ?MAKE_CONFIG_OPT(#config.public_list),
-     ?MAKE_CONFIG_OPT(#config.persistent),
-     ?MAKE_CONFIG_OPT(#config.moderated),
-     ?MAKE_CONFIG_OPT(#config.members_by_default),
-     ?MAKE_CONFIG_OPT(#config.members_only),
-     ?MAKE_CONFIG_OPT(#config.allow_user_invites),
-     ?MAKE_CONFIG_OPT(#config.password_protected),
-     ?MAKE_CONFIG_OPT(#config.captcha_protected),
-     ?MAKE_CONFIG_OPT(#config.password), ?MAKE_CONFIG_OPT(#config.anonymous),
-     ?MAKE_CONFIG_OPT(#config.logging), ?MAKE_CONFIG_OPT(#config.max_users),
-     ?MAKE_CONFIG_OPT(#config.allow_voice_requests),
-     ?MAKE_CONFIG_OPT(#config.allow_subscription),
-     ?MAKE_CONFIG_OPT(#config.mam),
-     ?MAKE_CONFIG_OPT(#config.presence_broadcast),
-     ?MAKE_CONFIG_OPT(#config.voice_request_min_interval),
-     ?MAKE_CONFIG_OPT(#config.vcard),
-     {captcha_whitelist,
-      (?SETS):to_list((StateData#state.config)#config.captcha_whitelist)},
-     {affiliations,
-      (?DICT):to_list(StateData#state.affiliations)},
+    [
+     {title, Config#config.title},
+     {allow_change_subj, Config#config.allow_change_subj},
+     {allow_query_users, Config#config.allow_query_users},
+     {allow_private_messages, Config#config.allow_private_messages},
+     {public, Config#config.public},
+     {public_list, Config#config.public_list},
+     {persistent, Config#config.persistent},
+     {moderated, Config#config.moderated},
+     {members_by_default, Config#config.members_by_default},
+     {members_only, Config#config.members_only},
+     {allow_user_invites, Config#config.allow_user_invites},
+     {password_protected, Config#config.password_protected},
+     {password, Config#config.password},
+     {anonymous, Config#config.anonymous},
+     {logging, Config#config.logging},
+     {max_users, Config#config.max_users},
+     {affiliations, ?DICT:to_list(StateData#state.affiliations)},
      {subject, StateData#state.subject},
-     {subject_author, StateData#state.subject_author},
-     {subscribers, Subscribers}].
+     {subject_author, StateData#state.subject_author}
+    ].
 
 
 %%----------------------------
@@ -1147,29 +919,5 @@ find_host(ServerHost) when is_list(ServerHost) ->
     find_host(list_to_binary(ServerHost));
 find_host(ServerHost) ->
     gen_mod:get_module_opt_host(ServerHost, mod_muc, <<"conference.@HOST@">>).
-
-find_hosts(Global) when Global == global;
-			Global == "global";
-			Global == <<"global">> ->
-    lists:flatmap(
-      fun(ServerHost) ->
-	      case gen_mod:is_loaded(ServerHost, mod_muc) of
-		  true ->
-		      [gen_mod:get_module_opt_host(
-			 ServerHost, mod_muc, <<"conference.@HOST@">>)];
-		  false ->
-		      []
-	      end
-      end, ?MYHOSTS);
-find_hosts(ServerHost) when is_list(ServerHost) ->
-    find_hosts(list_to_binary(ServerHost));
-find_hosts(ServerHost) ->
-    case gen_mod:is_loaded(ServerHost, mod_muc) of
-	true ->
-	    [gen_mod:get_module_opt_host(
-	       ServerHost, mod_muc, <<"conference.@HOST@">>)];
-	false ->
-	    []
-    end.
 
 mod_opt_type(_) -> [].

@@ -2,27 +2,9 @@
 %%% File    : ejabberd_sql_pt.erl
 %%% Author  : Alexey Shchepin <alexey@process-one.net>
 %%% Description : Parse transform for SQL queries
+%%%
 %%% Created : 20 Jan 2016 by Alexey Shchepin <alexey@process-one.net>
-%%%
-%%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
-%%%
-%%% This program is free software; you can redistribute it and/or
-%%% modify it under the terms of the GNU General Public License as
-%%% published by the Free Software Foundation; either version 2 of the
-%%% License, or (at your option) any later version.
-%%%
-%%% This program is distributed in the hope that it will be useful,
-%%% but WITHOUT ANY WARRANTY; without even the implied warranty of
-%%% MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-%%% General Public License for more details.
-%%%
-%%% You should have received a copy of the GNU General Public License along
-%%% with this program; if not, write to the Free Software Foundation, Inc.,
-%%% 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
-%%%
-%%%----------------------------------------------------------------------
-
+%%%-------------------------------------------------------------------
 -module(ejabberd_sql_pt).
 
 %% API
@@ -181,7 +163,7 @@ parse1([$@, $( | S], Acc, State) ->
                 EVar;
             boolean ->
                 erl_syntax:application(
-                  erl_syntax:atom(ejabberd_sql),
+                  erl_syntax:atom(ejabberd_odbc),
                   erl_syntax:atom(to_bool),
                   [EVar])
         end,
@@ -323,24 +305,20 @@ parse_upsert(Fields) ->
                                  "a constant string"})
                   end
           end, {[], 0}, Fields),
-    %io:format("upsert ~p~n", [{Fields, Fs}]),
+    %io:format("asd ~p~n", [{Fields, Fs}]),
     Fs.
 
-%% key | {Update}
 parse_upsert_field([$! | S], ParamPos, Loc) ->
     {Name, ParseState} = parse_upsert_field1(S, [], ParamPos, Loc),
-    {Name, key, ParseState};
-parse_upsert_field([$- | S], ParamPos, Loc) ->
-    {Name, ParseState} = parse_upsert_field1(S, [], ParamPos, Loc),
-    {Name, {false}, ParseState};
+    {Name, true, ParseState};
 parse_upsert_field(S, ParamPos, Loc) ->
     {Name, ParseState} = parse_upsert_field1(S, [], ParamPos, Loc),
-    {Name, {true}, ParseState}.
+    {Name, false, ParseState}.
 
 parse_upsert_field1([], _Acc, _ParamPos, Loc) ->
     throw({error, Loc,
            "?SQL_UPSERT fields must have the "
-           "following form: \"[!-]name=value\""});
+           "following form: \"[!]name=value\""});
 parse_upsert_field1([$= | S], Acc, ParamPos, Loc) ->
     {lists:reverse(Acc), parse(S, ParamPos, Loc)};
 parse_upsert_field1([C | S], Acc, ParamPos, Loc) ->
@@ -370,7 +348,7 @@ make_sql_upsert_generic(Table, ParseRes) ->
     InsertBranch =
         erl_syntax:case_expr(
           erl_syntax:application(
-            erl_syntax:atom(ejabberd_sql),
+            erl_syntax:atom(ejabberd_odbc),
             erl_syntax:atom(sql_query_t),
             [Insert]),
           [erl_syntax:clause(
@@ -383,7 +361,7 @@ make_sql_upsert_generic(Table, ParseRes) ->
              [erl_syntax:variable("__UpdateRes")])]),
     erl_syntax:case_expr(
       erl_syntax:application(
-        erl_syntax:atom(ejabberd_sql),
+        erl_syntax:atom(ejabberd_odbc),
         erl_syntax:atom(sql_query_t),
         [Update]),
       [erl_syntax:clause(
@@ -398,9 +376,9 @@ make_sql_upsert_generic(Table, ParseRes) ->
 make_sql_upsert_update(Table, ParseRes) ->
     WPairs =
         lists:flatmap(
-          fun({_Field, {_}, _ST}) ->
+          fun({_Field, false, _ST}) ->
                   [];
-             ({Field, key, ST}) ->
+             ({Field, true, ST}) ->
                   [ST#state{
                      'query' = [{str, Field}, {str, "="}] ++ ST#state.'query'
                     }]
@@ -408,11 +386,9 @@ make_sql_upsert_update(Table, ParseRes) ->
     Where = join_states(WPairs, " AND "),
     SPairs =
         lists:flatmap(
-          fun({_Field, key, _ST}) ->
+          fun({_Field, true, _ST}) ->
                   [];
-             ({_Field, {false}, _ST}) ->
-                  [];
-             ({Field, {true}, ST}) ->
+             ({Field, false, ST}) ->
                   [ST#state{
                      'query' = [{str, Field}, {str, "="}] ++ ST#state.'query'
                     }]
@@ -477,7 +453,7 @@ make_sql_upsert_pgsql901(Table, ParseRes) ->
           ]),
     Upsert = make_sql_query(State),
     erl_syntax:application(
-      erl_syntax:atom(ejabberd_sql),
+      erl_syntax:atom(ejabberd_odbc),
       erl_syntax:atom(sql_query_t),
       [Upsert]).
 
@@ -486,7 +462,7 @@ check_upsert(ParseRes, Pos) ->
     Set =
         lists:filter(
           fun({_Field, Match, _ST}) ->
-                  Match /= key
+                  not Match
           end, ParseRes),
     case Set of
         [] ->

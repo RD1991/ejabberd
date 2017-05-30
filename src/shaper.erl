@@ -5,7 +5,7 @@
 %%% Created :  9 Feb 2003 by Alexey Shchepin <alexey@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2016   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -25,17 +25,13 @@
 
 -module(shaper).
 
--behaviour(gen_server).
 -behaviour(ejabberd_config).
 
 -author('alexey@process-one.net').
 
--export([start_link/0, new/1, new1/1, update/2,
+-export([start/0, new/1, new1/1, update/2,
 	 get_max_rate/1, transform_options/1, load_from_config/0,
 	 opt_type/1]).
-%% gen_server callbacks
--export([init/1, handle_call/3, handle_cast/2, handle_info/2,
-	 terminate/2, code_change/3]).
 
 -include("ejabberd.hrl").
 -include("logger.hrl").
@@ -47,45 +43,26 @@
 -record(shaper, {name    :: {atom(), global},
                  maxrate :: integer()}).
 
--record(state, {}).
-
 -type shaper() :: none | #maxrate{}.
 
 -export_type([shaper/0]).
 
--spec start_link() -> {ok, pid()} | {error, any()}.
-start_link() ->
-    gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
+-spec start() -> ok.
 
-init([]) ->
-    ejabberd_mnesia:create(?MODULE, shaper,
+start() ->
+    mnesia:create_table(shaper,
                         [{ram_copies, [node()]},
                          {local_content, true},
 			 {attributes, record_info(fields, shaper)}]),
-    ejabberd_hooks:add(config_reloaded, ?MODULE, load_from_config, 20),
+    mnesia:add_table_copy(shaper, node(), ram_copies),
     load_from_config(),
-    {ok, #state{}}.
-
-handle_call(_Request, _From, State) ->
-    Reply = ok,
-    {reply, Reply, State}.
-
-handle_cast(_Msg, State) ->
-    {noreply, State}.
-
-handle_info(_Info, State) ->
-    {noreply, State}.
-
-terminate(_Reason, _State) ->
     ok.
-
-code_change(_OldVsn, State, _Extra) ->
-    {ok, State}.
 
 -spec load_from_config() -> ok | {error, any()}.
 
 load_from_config() ->
-    Shapers = ejabberd_config:get_option(shaper, []),
+    Shapers = ejabberd_config:get_option(
+                shaper, fun(V) -> V end, []),
     case mnesia:transaction(
            fun() ->
                    lists:foreach(
@@ -147,13 +124,9 @@ update(#maxrate{} = State, Size) ->
 	       true -> 0
 	    end,
     NextNow = p1_time_compat:system_time(micro_seconds) + Pause * 1000,
-    Div = case NextNow - State#maxrate.lasttime of
-        0 -> 1;
-        V -> V
-    end,
     {State#maxrate{lastrate =
 		       (State#maxrate.lastrate +
-			  1000000 * Size / Div)
+			  1000000 * Size / (NextNow - State#maxrate.lasttime))
 			 / 2,
 		   lasttime = NextNow},
      Pause}.
@@ -168,7 +141,5 @@ transform_options({OptName, Name, none}, Opts) when OptName == shaper ->
 transform_options(Opt, Opts) ->
     [Opt|Opts].
 
--spec opt_type(shaper) -> fun((any()) -> any());
-	      (atom()) -> [atom()].
 opt_type(shaper) -> fun (V) -> V end;
 opt_type(_) -> [shaper].

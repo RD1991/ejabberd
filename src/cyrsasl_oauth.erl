@@ -5,7 +5,7 @@
 %%% Created : 17 Sep 2015 by Alexey Shchepin <alexey@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2016   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -27,24 +27,17 @@
 
 -author('alexey@process-one.net').
 
--export([start/1, stop/0, mech_new/4, mech_step/2, parse/1, format_error/1]).
+-export([start/1, stop/0, mech_new/4, mech_step/2, parse/1]).
 
 -behaviour(cyrsasl).
 
 -record(state, {host}).
--type error_reason() :: parser_failed | not_authorized.
--export_type([error_reason/0]).
 
 start(_Opts) ->
-    cyrsasl:register_mechanism(<<"X-OAUTH2">>, ?MODULE, plain).
+    cyrsasl:register_mechanism(<<"X-OAUTH2">>, ?MODULE, plain),
+    ok.
 
 stop() -> ok.
-
--spec format_error(error_reason()) -> {atom(), binary()}.
-format_error(parser_failed) ->
-    {'bad-protocol', <<"Response decoding failed">>};
-format_error(not_authorized) ->
-    {'not-authorized', <<"Invalid token">>}.
 
 mech_new(Host, _GetPassword, _CheckPassword, _CheckPasswordDigest) ->
     {ok, #state{host = Host}}.
@@ -53,15 +46,15 @@ mech_step(State, ClientIn) ->
     case prepare(ClientIn) of
         [AuthzId, User, Token] ->
             case ejabberd_oauth:check_token(
-                   User, State#state.host, [<<"sasl_auth">>], Token) of
+                   User, State#state.host, <<"sasl_auth">>, Token) of
                 true ->
                     {ok,
                      [{username, User}, {authzid, AuthzId},
                       {auth_module, ejabberd_oauth}]};
-                _ ->
-                    {error, not_authorized, User}
+                false ->
+                    {error, <<"not-authorized">>, User}
             end;
-        _ -> {error, parser_failed}
+        _ -> {error, <<"bad-protocol">>}
     end.
 
 prepare(ClientIn) ->
@@ -69,18 +62,12 @@ prepare(ClientIn) ->
         [<<"">>, UserMaybeDomain, Token] ->
             case parse_domain(UserMaybeDomain) of
                 %% <NUL>login@domain<NUL>pwd
-                [User, _Domain] -> [User, User, Token];
+                [User, _Domain] -> [UserMaybeDomain, User, Token];
                 %% <NUL>login<NUL>pwd
-                [User] -> [User, User, Token]
+                [User] -> [<<"">>, User, Token]
             end;
         %% login@domain<NUL>login<NUL>pwd
-        [AuthzId, User, Token] ->
-            case parse_domain(AuthzId) of
-                %% login@domain<NUL>login<NUL>pwd
-                [AuthzUser, _Domain] -> [AuthzUser, User, Token];
-                %% login<NUL>login<NUL>pwd
-                [AuthzUser] -> [AuthzUser, User, Token]
-            end;
+        [AuthzId, User, Token] -> [AuthzId, User, Token];
         _ -> error
     end.
 

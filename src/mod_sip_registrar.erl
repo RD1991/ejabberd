@@ -1,11 +1,12 @@
 %%%-------------------------------------------------------------------
-%%% File    : mod_sip_registrar.erl
-%%% Author  : Evgeny Khramtsov <ekhramtsov@process-one.net>
-%%% Purpose : 
+%%% @author Evgeny Khramtsov <ekhramtsov@process-one.net>
+%%% @doc
+%%%
+%%% @end
 %%% Created : 23 Apr 2014 by Evgeny Khramtsov <ekhramtsov@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2014-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2014-2016   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -24,12 +25,7 @@
 %%%-------------------------------------------------------------------
 -module(mod_sip_registrar).
 
--ifndef(SIP).
--export([]).
--else.
--ifndef(GEN_SERVER).
--define(GEN_SERVER, gen_server).
--endif.
+-define(GEN_SERVER, p1_server).
 -behaviour(?GEN_SERVER).
 
 %% API
@@ -54,7 +50,7 @@
 		      cseq = 0 :: non_neg_integer(),
 		      timestamp = p1_time_compat:timestamp() :: erlang:timestamp(),
 		      contact :: {binary(), #uri{}, [{binary(), binary()}]},
-		      flow_tref :: reference() | undefined,
+		      flow_tref :: reference(),
 		      reg_tref = make_ref() :: reference(),
 		      conn_mref = make_ref() :: reference(),
 		      expires = 0 :: non_neg_integer()}).
@@ -182,13 +178,14 @@ ping(SIPSocket) ->
 %%% gen_server callbacks
 %%%===================================================================
 init([]) ->
-    process_flag(trap_exit, true),
     update_table(),
-    ejabberd_mnesia:create(?MODULE, sip_session,
+    mnesia:create_table(sip_session,
 			[{ram_copies, [node()]},
 			 {type, bag},
-			 {attributes, record_info(fields, sip_session)},
-			 {index, [conn_mref,socket]}]),
+			 {attributes, record_info(fields, sip_session)}]),
+    mnesia:add_table_index(sip_session, conn_mref),
+    mnesia:add_table_index(sip_session, socket),
+    mnesia:add_table_copy(sip_session, node(), ram_copies),
     {ok, #state{}}.
 
 handle_call({write, Sessions, Supported}, _From, State) ->
@@ -358,7 +355,7 @@ min_expires() ->
     60.
 
 to_integer(Bin, Min, Max) ->
-    case catch (binary_to_integer(Bin)) of
+    case catch list_to_integer(binary_to_list(Bin)) of
         N when N >= Min, N =< Max ->
             {ok, N};
         _ ->
@@ -497,10 +494,12 @@ get_flow_timeout(LServer, #sip_socket{type = Type}) ->
 	udp ->
 	    gen_mod:get_module_opt(
 	      LServer, mod_sip, flow_timeout_udp,
+	      fun(I) when is_integer(I), I>0 -> I end,
 	      ?FLOW_TIMEOUT_UDP);
 	_ ->
 	    gen_mod:get_module_opt(
 	      LServer, mod_sip, flow_timeout_tcp,
+	      fun(I) when is_integer(I), I>0 -> I end,
 	      ?FLOW_TIMEOUT_TCP)
     end.
 
@@ -583,5 +582,3 @@ process_ping(SIPSocket) ->
 	 (_, Acc) ->
 	      Acc
       end, ErrResponse, Sessions).
-
--endif.

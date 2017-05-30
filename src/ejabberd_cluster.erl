@@ -5,7 +5,7 @@
 %%% Created : 7 Oct 2015 by Christophe Romain <christophe.romain@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2016   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -26,10 +26,8 @@
 -module(ejabberd_cluster).
 
 %% API
--export([get_nodes/0, call/4, multicall/3, multicall/4,
-	 eval_everywhere/3, eval_everywhere/4]).
--export([join/1, leave/1, get_known_nodes/0]).
--export([node_id/0, get_node_by_id/1]).
+-export([get_nodes/0, call/4, multicall/3, multicall/4]).
+-export([join/1, leave/1]).
 
 -include("ejabberd.hrl").
 -include("logger.hrl").
@@ -38,12 +36,6 @@
 
 get_nodes() ->
     mnesia:system_info(running_db_nodes).
-
--spec get_known_nodes() -> [node()].
-
-get_known_nodes() ->
-    lists:usort(mnesia:system_info(db_nodes)
-		++ mnesia:system_info(extra_db_nodes)).
 
 -spec call(node(), module(), atom(), [any()]) -> any().
 
@@ -59,18 +51,6 @@ multicall(Module, Function, Args) ->
 
 multicall(Nodes, Module, Function, Args) ->
     rpc:multicall(Nodes, Module, Function, Args, 5000).
-
--spec eval_everywhere(module(), atom(), [any()]) -> ok.
-
-eval_everywhere(Module, Function, Args) ->
-    eval_everywhere(get_nodes(), Module, Function, Args),
-    ok.
-
--spec eval_everywhere([node()], module(), atom(), [any()]) -> ok.
-
-eval_everywhere(Nodes, Module, Function, Args) ->
-    rpc:eval_everywhere(Nodes, Module, Function, Args),
-    ok.
 
 -spec join(node()) -> ok | {error, any()}.
 
@@ -122,31 +102,3 @@ leave([Master|_], Node) ->
                 erlang:halt(0)
         end),
     ok.
-
--spec node_id() -> binary().
-node_id() ->
-    integer_to_binary(erlang:phash2(node())).
-
--spec get_node_by_id(binary()) -> node().
-get_node_by_id(Hash) ->
-    try binary_to_integer(Hash) of
-	I -> match_node_id(I)
-    catch _:_ ->
-	    node()
-    end.
-
-%%%===================================================================
-%%% Internal functions
-%%%===================================================================
--spec match_node_id(integer()) -> node().
-match_node_id(I) ->
-    match_node_id(I, get_nodes()).
-
--spec match_node_id(integer(), [node()]) -> node().
-match_node_id(I, [Node|Nodes]) ->
-    case erlang:phash2(Node) of
-	I -> Node;
-	_ -> match_node_id(I, Nodes)
-    end;
-match_node_id(_I, []) ->
-    node().

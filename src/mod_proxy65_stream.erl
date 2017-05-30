@@ -4,7 +4,7 @@
 %%% Purpose : Bytestream process.
 %%% Created : 12 Oct 2006 by Evgeniy Khramtsov <xram@jabber.ru>
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2016   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -38,7 +38,7 @@
 	 stream_established/2]).
 
 -export([start/2, stop/1, start_link/3, activate/2,
-	 relay/3, socket_type/0, listen_opt_type/1]).
+	 relay/3, socket_type/0]).
 
 -include("mod_proxy65.hrl").
 
@@ -65,10 +65,9 @@ code_change(_OldVsn, StateName, StateData, _Extra) ->
 %%-------------------------------
 
 start({gen_tcp, Socket}, Opts1) ->
-    {[{server_host, Host}], Opts} = lists:partition(
-				      fun({server_host, _}) -> true;
-					 (_) -> false
-				      end, Opts1),
+    {[Host], Opts} = lists:partition(fun (O) -> is_binary(O)
+				     end,
+				     Opts1),
     Supervisor = gen_mod:get_module_proc(Host,
 					 ejabberd_mod_proxy65_sup),
     supervisor:start_child(Supervisor,
@@ -79,10 +78,19 @@ start_link(Socket, Host, Opts) ->
 
 init([Socket, Host, Opts]) ->
     process_flag(trap_exit, true),
-    AuthType = gen_mod:get_opt(auth_type, Opts, anonymous),
-    Shaper = gen_mod:get_opt(shaper, Opts, none),
-    RecvBuf = gen_mod:get_opt(recbuf, Opts, 8192),
-    SendBuf = gen_mod:get_opt(sndbuf, Opts, 8192),
+    AuthType = gen_mod:get_opt(auth_type, Opts,
+                               fun(plain) -> plain;
+                                  (anonymous) -> anonymous
+                               end, anonymous),
+    Shaper = gen_mod:get_opt(shaper, Opts,
+                             fun(A) when is_atom(A) -> A end,
+                             none),
+    RecvBuf = gen_mod:get_opt(recbuf, Opts,
+                              fun(I) when is_integer(I), I>0 -> I end,
+                              8192),
+    SendBuf = gen_mod:get_opt(sndbuf, Opts,
+                              fun(I) when is_integer(I), I>0 -> I end,
+                              8192),
     TRef = erlang:send_after(?WAIT_TIMEOUT, self(), stop),
     inet:setopts(Socket,
 		 [{active, true}, {recbuf, RecvBuf}, {sndbuf, SendBuf}]),
@@ -91,10 +99,9 @@ init([Socket, Host, Opts]) ->
 	    socket = Socket, shaper = Shaper, timer = TRef}}.
 
 terminate(_Reason, StateName, #state{sha1 = SHA1}) ->
-    Mod = gen_mod:ram_db_mod(global, mod_proxy65),
-    Mod:unregister_stream(SHA1),
+    catch mod_proxy65_sm:unregister_stream(SHA1),
     if StateName == stream_established ->
-	   ?INFO_MSG("(~w) Bytestream terminated", [self()]);
+	   ?INFO_MSG("Bytestream terminated", []);
        true -> ok
     end.
 
@@ -113,8 +120,8 @@ activate({P1, J1}, {P2, J2}) ->
       {S1, S2} when is_port(S1), is_port(S2) ->
 	  P1 ! {activate, P2, S2, J1, J2},
 	  P2 ! {activate, P1, S1, J1, J2},
-	  JID1 = jid:encode(J1),
-	  JID2 = jid:encode(J2),
+	  JID1 = jid:to_string(J1),
+	  JID2 = jid:to_string(J2),
 	  ?INFO_MSG("(~w:~w) Activated bytestream for ~s "
 		    "-> ~s",
 		    [P1, P2, JID1, JID2]),
@@ -161,9 +168,8 @@ wait_for_request(Packet,
     Request = mod_proxy65_lib:unpack_request(Packet),
     case Request of
       #s5_request{sha1 = SHA1, cmd = connect} ->
-	  Mod = gen_mod:ram_db_mod(global, mod_proxy65),
-	  case Mod:register_stream(SHA1, self()) of
-	    ok ->
+	  case catch mod_proxy65_sm:register_stream(SHA1) of
+	    {atomic, ok} ->
 		inet:setopts(Socket, [{active, false}]),
 		gen_tcp:send(Socket,
 			     mod_proxy65_lib:make_reply(Request)),
@@ -282,17 +288,3 @@ find_maxrate(Shaper, JID1, JID2, Host) ->
     if MaxRate1 == none; MaxRate2 == none -> none;
        true -> lists:max([MaxRate1, MaxRate2])
     end.
-
-listen_opt_type(server_host) ->
-    fun iolist_to_binary/1;
-listen_opt_type(auth_type) ->
-    fun (plain) -> plain;
-	(anonymous) -> anonymous
-    end;
-listen_opt_type(recbuf) ->
-    fun (I) when is_integer(I), I > 0 -> I end;
-listen_opt_type(shaper) -> fun acl:shaper_rules_validator/1;
-listen_opt_type(sndbuf) ->
-    fun (I) when is_integer(I), I > 0 -> I end;
-listen_opt_type(_) ->
-    [auth_type, recbuf, sndbuf, shaper].
