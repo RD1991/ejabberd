@@ -94,7 +94,7 @@ log_rate_limit: 100
 ##   - "example.org"
 ##
 hosts:
-  - "grup-stg.cloudapp.net"
+  - "localhost"
 
 ##
 ## route_subdomains: Delegate subdomains to other XMPP servers.
@@ -200,7 +200,7 @@ listen:
 acl:
     xmlrpc:
         user:
-          - "admin": "grup-stg.cloudapp.net"
+          - "admin": "localhost"
 
 access:
     xmlrpc:
@@ -434,7 +434,7 @@ max_fsm_queue: 1000
 acl:
   admin:
     user:
-      - "admin": "grup-stg.cloudapp.net"
+      - "admin": "localhost"
       - "chetan": "localhost"
 
   ##
